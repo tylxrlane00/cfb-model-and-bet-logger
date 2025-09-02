@@ -1,0 +1,29 @@
+{
+  "DEFAULT_HFA_POINTS": 2.5,
+  "SPREAD_SIGMA_PTS": 13.0,
+  "TOTALS_SIGMA_PTS": 11.0,
+
+  "MARKET_BLEND": { "use": true, "spread_weight": 0.25, "total_weight": 0.25 },
+  "EV_THRESHOLDS": { "strong": 0.05, "lean": 0.02 },
+
+  "ADV_OFF_WEIGHTS": {
+    "ppa": 0.45,
+    "success": 0.25,
+    "explosiveness": 0.15,
+    "power": 0.05,
+    "ppo": 0.07,
+    "std_sr": 0.03,
+    "rush_ppa": 0.00,
+    "pass_ppa": 0.00
+  },
+  "ADV_DEF_WEIGHTS": {
+    "ppa": 0.50,
+    "success": 0.20,
+    "explosiveness": 0.15,
+    "power": 0.05,
+    "ppo": 0.07,
+    "havoc": 0.03,
+    "rush_ppa": 0.00,
+    "pass_ppa": 0.00
+  }
+}

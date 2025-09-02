@@ -1,0 +1,34 @@
+{
+  "room": "main",
+  "base_params": {
+    "BASE_TEAM_POINTS": 27.0,
+    "RATING_SCALE_TO_POINTS": 7.5,
+    "MIN_SD_POINTS": 10.0,
+    "MAX_SD_POINTS": 24.0
+  },
+  "off_weights": {
+    "offense.ppa": 0.35,
+    "offense.successRate": 0.2,
+    "offense.explosiveness": 0.1,
+    "offense.powerSuccess": 0.05,
+    "offense.pointsPerOpportunity": 0.1,
+    "offense.fieldPosition.averageStart": 0.05,
+    "offense.standardDowns.successRate": 0.05,
+    "offense.passingDowns.ppa": 0.05,
+    "offense.rushingPlays.ppa": 0.025,
+    "offense.passingPlays.ppa": 0.025
+  },
+  "def_weights": {
+    "defense.ppa": -0.35,
+    "defense.successRate": -0.2,
+    "defense.explosiveness": -0.1,
+    "defense.powerSuccess": -0.05,
+    "defense.stuffRate": 0.075,
+    "defense.pointsPerOpportunity": -0.1,
+    "defense.fieldPosition.averageStart": -0.05,
+    "defense.havoc.total": 0.075,
+    "defense.rushingPlays.ppa": -0.025,
+    "defense.passingPlays.ppa": -0.025
+  },
+  "ts": "2025-09-02 14:46:49"
+}
