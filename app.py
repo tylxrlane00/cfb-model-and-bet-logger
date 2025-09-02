@@ -67,8 +67,8 @@ LOCAL_SETTINGS_FILE = "model_settings.json"
 
 # =============================== Supabase helpers ===============================
 def _supabase_client() -> Optional[Client]:
-    url = st.secrets.get("SUPABASE_URL")
-    key = st.secrets.get("SUPABASE_SERVICE_KEY")
+    url = st.secrets.get("SB_URL")
+    key = st.secrets.get("SB_SERVICE_KEY")
     if not url or not key:
         return None
     return create_client(url, key)
