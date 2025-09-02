@@ -1,5 +1,5 @@
 # app.py — CFB PPA Monte Carlo Predictor + Supabase + Bet Board + Projections Manager + Tuning
-# Run: pip install streamlit pandas numpy requests supabase && streamlit run app.py
+# Run locally: pip install streamlit pandas numpy requests supabase python-dateutil && streamlit run app.py
 
 import os, io, json, time
 import numpy as np
@@ -67,8 +67,10 @@ LOCAL_SETTINGS_FILE = "model_settings.json"
 
 # =============================== Supabase helpers ===============================
 def _supabase_client() -> Optional[Client]:
+    # NOTE: if your secret is named SB_SERVICE_ROLE_KEY, either add an alias SB_SERVICE_KEY
+    # in your hosting secrets, or change this line to st.secrets.get("SB_SERVICE_ROLE_KEY")
     url = st.secrets.get("SB_URL")
-    key = st.secrets.get("SB_SERVICE_KEY")
+    key = st.secrets.get("SB_SERVICE_KEY") or st.secrets.get("SB_SERVICE_ROLE_KEY")
     if not url or not key:
         return None
     return create_client(url, key)
@@ -429,56 +431,64 @@ with st.sidebar:
     st.session_state["room"] = st.text_input("Room (namespace)", value=st.secrets.get("ROOM", "main"))
     st.caption(f"Persistence: **{persistence_mode()}** (room: `{_room()}`)")
 
-if df.empty: st.stop()
-missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-if missing: st.error(f"CSV missing required columns: {missing}"); st.stop()
-df = coerce_and_impute(df)
-
-# Load model settings
+# Always load settings so Tuning can work without data
 BASE, OFF_WEIGHTS, DEF_WEIGHTS = load_settings()
 
-# Z-scores & team list
-zcols = list(set(list(OFF_WEIGHTS.keys()) + list(DEF_WEIGHTS.keys())))
-df_z = zscore_columns(df, zcols)
-team_list = sorted(df_z["team"].unique().tolist())
+# Determine whether we have valid data for simulations
+has_data = False
+if df.empty:
+    st.info("No CSV loaded — logging-only mode. You can still use **Bet Logger** and view **Saved Projections**.")
+else:
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        st.warning(f"CSV missing required columns: {missing}. Logging-only mode enabled.")
+    else:
+        df = coerce_and_impute(df)
+        zcols = list(set(list(OFF_WEIGHTS.keys()) + list(DEF_WEIGHTS.keys())))
+        df_z = zscore_columns(df, zcols)
+        team_list = sorted(df_z["team"].unique().tolist())
+        has_data = True
 
 # =============================== Sticky matchup ===============================
-st.markdown('<div class="sticky-wrap">', unsafe_allow_html=True)
-t1, t2, t3 = st.columns([1.2, 1.2, 0.6])
-with t1: home = st.selectbox("Home team", team_list, key="home_team_top")
-with t2: away = st.selectbox("Away team", team_list, index=1 if len(team_list) > 1 else 0, key="away_team_top")
-with t3:
-    cA, cB = st.columns(2)
-    with cA:
-        if st.button("Swap"): st.session_state["home_team_top"], st.session_state["away_team_top"] = (
-            st.session_state["away_team_top"], st.session_state["home_team_top"]); st.rerun()
-    with cB: neutral = st.toggle("Neutral", value=False)
-st.markdown('</div>', unsafe_allow_html=True)
-if home == away: st.warning("Pick two different teams."); st.stop()
+if has_data:
+    st.markdown('<div class="sticky-wrap">', unsafe_allow_html=True)
+    t1, t2, t3 = st.columns([1.2, 1.2, 0.6])
+    with t1: home = st.selectbox("Home team", team_list, key="home_team_top")
+    with t2: away = st.selectbox("Away team", team_list, index=1 if len(team_list) > 1 else 0, key="away_team_top")
+    with t3:
+        cA, cB = st.columns(2)
+        with cB: neutral = st.toggle("Neutral", value=False)
+    st.markdown('</div>', unsafe_allow_html=True)
+    if home == away: st.warning("Pick two different teams."); st.stop()
+else:
+    st.info("Logging-only mode: upload a CSV to unlock matchup sims & projections. Bet Logger works below.")
 
 # =============================== Tabs ===============================
 tabs = st.tabs(["Adjustments", "Tuning", "Bet Logger", "Saved Projections"])
 
 # ---------- Adjustments ----------
 with tabs[0]:
-    left, right = st.columns([1, 1], gap="large")
-    with left:
-        st.subheader("Weather & Context")
-        indoor = st.checkbox("Indoors / Roof Closed", value=False)
-        temp_f = st.slider("Temperature (°F)", -10, 110, 65, 1, disabled=indoor)
-        wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, disabled=indoor)
-        precip = st.select_slider("Precipitation", ["None","Light","Moderate","Heavy"], value="None", disabled=indoor)
-        hfa = 0.0 if neutral else st.slider("Home Field Advantage (pts)", 0.0, 6.0, 2.5, 0.5)
-    with right:
-        st.subheader("Market & Simulation")
-        st.caption("Spread is **home-based** (negative = home favored).")
-        market_spread_home = st.number_input("Market Spread (Home perspective)", value=-3.0, step=0.5, format="%.1f")
-        market_total = st.number_input("Market Total", value=52.5, step=0.5, format="%.1f")
-        spread_odds = st.number_input("Spread Price (American)", value=-110, step=5)
-        total_odds = st.number_input("Total Price (American)", value=-110, step=5)
-        market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.35, 0.05)
-        n_sims = st.slider("Number of Simulations", 1000, 50000, 10000, 1000)
-        seed = st.number_input("Random Seed", value=42, step=1)
+    if not has_data:
+        st.info("Upload a CSV to run simulations. Bet Logger is available without data.")
+    else:
+        left, right = st.columns([1, 1], gap="large")
+        with left:
+            st.subheader("Weather & Context")
+            indoor = st.checkbox("Indoors / Roof Closed", value=False)
+            temp_f = st.slider("Temperature (°F)", -10, 110, 65, 1, disabled=indoor)
+            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, disabled=indoor)
+            precip = st.select_slider("Precipitation", ["None","Light","Moderate","Heavy"], value="None", disabled=indoor)
+            hfa = 0.0 if neutral else st.slider("Home Field Advantage (pts)", 0.0, 6.0, 2.5, 0.5)
+        with right:
+            st.subheader("Market & Simulation")
+            st.caption("Spread is **home-based** (negative = home favored).")
+            market_spread_home = st.number_input("Market Spread (Home perspective)", value=-3.0, step=0.5, format="%.1f")
+            market_total = st.number_input("Market Total", value=52.5, step=0.5, format="%.1f")
+            spread_odds = st.number_input("Spread Price (American)", value=-110, step=5)
+            total_odds = st.number_input("Total Price (American)", value=-110, step=5)
+            market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.35, 0.05)
+            n_sims = st.slider("Number of Simulations", 1000, 50000, 10000, 1000)
+            seed = st.number_input("Random Seed", value=42, step=1)
 
 # ---------- Tuning ----------
 with tabs[1]:
@@ -519,8 +529,8 @@ with tabs[1]:
         return out
 
     with t_right:
-        off_new = _weights_editor("Offense Weights", OFF_WEIGHTS)
-        def_new = _weights_editor("Defense Weights", DEF_WEIGHTS)
+        off_new = _weights_editor("Offense Weights", DEFAULT_OFF_WEIGHTS if not has_data else DEFAULT_OFF_WEIGHTS | OFF_WEIGHTS)
+        def_new = _weights_editor("Defense Weights", DEFAULT_DEF_WEIGHTS if not has_data else DEFAULT_DEF_WEIGHTS | DEF_WEIGHTS)
 
     st.markdown("---")
     t1, t2 = st.columns([1,3])
@@ -531,82 +541,79 @@ with tabs[1]:
             else: st.error("Could not save settings.")
     st.caption("Weights do not need to sum to 1, but normalization helps comparability. Defense weights may be negative where lower is better (e.g., success rate).")
 
-# =============================== Model compute (uses tuned settings) ===============================
-home_row = team_row(df_z, home); away_row = team_row(df_z, away)
-home_off = composite_rating(home_row, OFF_WEIGHTS); home_def = composite_rating(home_row, DEF_WEIGHTS)
-away_off = composite_rating(away_row, OFF_WEIGHTS); away_def = composite_rating(away_row, DEF_WEIGHTS)
+# =============================== Model compute & Summary (only with data) ===============================
+if has_data:
+    home_row = team_row(df_z, home); away_row = team_row(df_z, away)
+    home_off = composite_rating(home_row, OFF_WEIGHTS); home_def = composite_rating(home_row, DEF_WEIGHTS)
+    away_off = composite_rating(away_row, OFF_WEIGHTS); away_def = composite_rating(away_row, DEF_WEIGHTS)
 
-mu_home_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (home_off - away_def)
-mu_away_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (away_off - home_def)
-hfa_pts = 0.0 if neutral else hfa
-mu_home_raw += hfa_pts/2.0; mu_away_raw -= hfa_pts/2.0
+    mu_home_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (home_off - away_def)
+    mu_away_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (away_off - home_def)
+    hfa_pts = 0.0 if neutral else hfa
+    mu_home_raw += hfa_pts/2.0; mu_away_raw -= hfa_pts/2.0
 
-w_mult = weather_multiplier(
-    st.session_state.get("Temperature (°F)", 65) if False else st.session_state.get("foo", 0),  # keep names clean
-    0, "None", False)  # dummy line to please some IDEs (logic below)
-# (Use true values from Adjustments tab)
-w_mult = weather_multiplier(temp_f, wind_mph, precip, indoor)
+    w_mult = weather_multiplier(temp_f, wind_mph, precip, indoor)
 
-mu_home = mu_home_raw * w_mult; mu_away = mu_away_raw * w_mult
-sd_home = volatility_sd_dyn(home_row, away_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
-sd_away = volatility_sd_dyn(away_row, home_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
-if not indoor:
-    sd_tighten = 1.0 - (1.0 - w_mult)*0.5
-    sd_home *= sd_tighten; sd_away *= sd_tighten
+    mu_home = mu_home_raw * w_mult; mu_away = mu_away_raw * w_mult
+    sd_home = volatility_sd_dyn(home_row, away_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
+    sd_away = volatility_sd_dyn(away_row, home_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
+    if not indoor:
+        sd_tighten = 1.0 - (1.0 - w_mult)*0.5
+        sd_home *= sd_tighten; sd_away *= sd_tighten
 
-home_scores, away_scores = simulate_scores(mu_home, mu_away, sd_home, sd_away, int(n_sims), int(seed))
-margins = home_scores - away_scores; totals = home_scores + away_scores
-model_spread = float(np.mean(margins)); model_total = float(np.mean(totals))
-blend_spread = (1 - market_weight) * model_spread + market_weight * market_spread_home
-blend_total  = (1 - market_weight) * model_total  + market_weight * market_total
-metrics = cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, int(spread_odds), int(total_odds))
-recommendation = choose_recommendation(metrics, market_spread_home, market_total)
-proj_home = float(np.mean(home_scores)); proj_away = float(np.mean(away_scores))
-winner = home if proj_home > proj_away else away
+    home_scores, away_scores = simulate_scores(mu_home, mu_away, sd_home, sd_away, int(n_sims), int(seed))
+    margins = home_scores - away_scores; totals = home_scores + away_scores
+    model_spread = float(np.mean(margins)); model_total = float(np.mean(totals))
+    blend_spread = (1 - market_weight) * model_spread + market_weight * market_spread_home
+    blend_total  = (1 - market_weight) * model_total  + market_weight * market_total
+    metrics = cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, int(spread_odds), int(total_odds))
+    recommendation = choose_recommendation(metrics, market_spread_home, market_total)
+    proj_home = float(np.mean(home_scores)); proj_away = float(np.mean(away_scores))
+    winner = home if proj_home > proj_away else away
 
-# =============================== Summary Card ===============================
-st.markdown('<div class="summary-card">', unsafe_allow_html=True)
-st.markdown(f"""
-<div class="summary-grid">
-  <div class="summary-item"><div class="label">Projected Score</div>
-    <div class="value">{home}: {proj_home:.1f}</div></div>
-  <div class="summary-item"><div class="label">&nbsp;</div>
-    <div class="value">{away}: {proj_away:.1f}</div></div>
-  <div class="summary-item"><div class="label">Projected Winner</div>
-    <div class="value winner">{winner}</div></div>
-  <div class="summary-item"><div class="label">Blended Spread (H−A)</div>
-    <div class="value">{blend_spread:+.2f}</div></div>
-  <div class="summary-item"><div class="label">Blended Total</div>
-    <div class="value">{blend_total:.2f}</div></div>
-  <div class="summary-item"><div class="label">Recommendation</div>
-    <div class="value">{recommendation['confidence']} — {recommendation['label']}</div></div>
-</div>
-""", unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+    # ----- Summary Card -----
+    st.markdown('<div class="summary-card">', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="summary-grid">
+      <div class="summary-item"><div class="label">Projected Score</div>
+        <div class="value">{home}: {proj_home:.1f}</div></div>
+      <div class="summary-item"><div class="label">&nbsp;</div>
+        <div class="value">{away}: {proj_away:.1f}</div></div>
+      <div class="summary-item"><div class="label">Projected Winner</div>
+        <div class="value winner">{winner}</div></div>
+      <div class="summary-item"><div class="label">Blended Spread (H−A)</div>
+        <div class="value">{blend_spread:+.2f}</div></div>
+      <div class="summary-item"><div class="label">Blended Total</div>
+        <div class="value">{blend_total:.2f}</div></div>
+      <div class="summary-item"><div class="label">Recommendation</div>
+        <div class="value">{recommendation['confidence']} — {recommendation['label']}</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# =============================== Quick metrics ===============================
-c1, c2, c3 = st.columns([1,1,1])
-with c1:
-    st.subheader("Projected Score (Raw Model)")
-    st.metric(home, f"{proj_home:.1f}"); st.metric(away, f"{proj_away:.1f}")
-    st.caption(f"Median: {home} {np.median(home_scores):.0f} — {away} {np.median(away_scores):.0f}")
-with c2:
-    st.subheader("Model Lines"); st.metric("Spread (H−A)", f"{model_spread:+.2f}"); st.metric("Total", f"{model_total:.2f}")
-    st.caption("Negative spread ⇒ Home favored.")
-with c3:
-    st.subheader("Market-Blended Lines"); st.metric("Blended Spread", f"{blend_spread:+.2f}"); st.metric("Blended Total", f"{blend_total:.2f}")
-    st.caption(f"Blend: {100*(1-market_weight):.0f}% model / {100*market_weight:.0f}% market")
+    # ----- Quick metrics -----
+    c1, c2, c3 = st.columns([1,1,1])
+    with c1:
+        st.subheader("Projected Score (Raw Model)")
+        st.metric(home, f"{proj_home:.1f}"); st.metric(away, f"{proj_away:.1f}")
+        st.caption(f"Median: {home} {np.median(home_scores):.0f} — {away} {np.median(away_scores):.0f}")
+    with c2:
+        st.subheader("Model Lines"); st.metric("Spread (H−A)", f"{model_spread:+.2f}"); st.metric("Total", f"{model_total:.2f}")
+        st.caption("Negative spread ⇒ Home favored.")
+    with c3:
+        st.subheader("Market-Blended Lines"); st.metric("Blended Spread", f"{blend_spread:+.2f}"); st.metric("Blended Total", f"{blend_total:.2f}")
+        st.caption(f"Blend: {100*(1-market_weight):.0f}% model / {100*market_weight:.0f}% market")
 
-st.divider()
-a,b,c,d,e = st.columns(5)
-with a: st.metric(f"Home {market_spread_home:+g}", f"{metrics['p_home_cover']*100:.1f}%"); st.caption(f"EV @ {spread_odds}: {metrics['ev_home_spread']:.3f}/1u")
-with b: st.metric(f"Away {-market_spread_home:+g}", f"{metrics['p_away_cover']*100:.1f}%"); st.caption(f"EV @ {spread_odds}: {metrics['ev_away_spread']:.3f}/1u")
-with c: st.metric(f"Over {market_total:g}", f"{metrics['p_over']*100:.1f}%"); st.caption(f"EV @ {total_odds}: {metrics['ev_over']:.3f}/1u")
-with d: st.metric(f"Under {market_total:g}", f"{metrics['p_under']*100:.1f}%"); st.caption(f"EV @ {total_odds}: {metrics['ev_under']:.3f}/1u")
-with e: st.metric("Win Prob (Model)", f"{metrics['home_win']*100:.1f}% {home}"); st.caption(f"{away}: {metrics['away_win']*100:.1f}%")
+    st.divider()
+    a,b,c,d,e = st.columns(5)
+    with a: st.metric(f"Home {market_spread_home:+g}", f"{metrics['p_home_cover']*100:.1f}%"); st.caption(f"EV @ {spread_odds}: {metrics['ev_home_spread']:.3f}/1u")
+    with b: st.metric(f"Away {-market_spread_home:+g}", f"{metrics['p_away_cover']*100:.1f}%"); st.caption(f"EV @ {spread_odds}: {metrics['ev_away_spread']:.3f}/1u")
+    with c: st.metric(f"Over {market_total:g}", f"{metrics['p_over']*100:.1f}%"); st.caption(f"EV @ {total_odds}: {metrics['ev_over']:.3f}/1u")
+    with d: st.metric(f"Under {market_total:g}", f"{metrics['p_under']*100:.1f}%"); st.caption(f"EV @ {total_odds}: {metrics['ev_under']:.3f}/1u")
+    with e: st.metric("Win Prob (Model)", f"{metrics['home_win']*100:.1f}% {home}"); st.caption(f"{away}: {metrics['away_win']*100:.1f}%")
 
-st.subheader("Recommendation")
-st.write(f"**{recommendation['confidence']}** — {recommendation['label']} (EV {recommendation['ev']:.3f}/1u, P {recommendation['p']*100:.1f}%).")
+    st.subheader("Recommendation")
+    st.write(f"**{recommendation['confidence']}** — {recommendation['label']} (EV {recommendation['ev']:.3f}/1u, P {recommendation['p']*100:.1f}%).")
 
 # =============================== Bet Logger =========================== #
 def _profit_units(row) -> float:
@@ -734,13 +741,25 @@ with tabs[2]:
 
     st.markdown("---")
     st.markdown("### Log a Bet")
+
     with st.form("bet_form"):
         bettor = st.selectbox("Bettor", board_names, index=0)
         sportsbook = st.text_input("Sportsbook", value="—")
         bet_type = st.selectbox("Bet Type", ["Spread","Total","Moneyline"], index=0)
 
+        # Names for the pick, based on mode
+        if has_data:
+            home_name, away_name = home, away
+        else:
+            c1, c2 = st.columns(2)
+            with c1: home_name = st.text_input("Home team", "")
+            with c2: away_name = st.text_input("Away team", "")
+            if not (home_name and away_name):
+                st.caption("Enter both team names to include them in the pick/Discord message.")
+
+        # Pick builder
         if bet_type == "Spread":
-            side = st.selectbox("Side", [f"Home ({home})", f"Away ({away})"])
+            side = st.selectbox("Side", [f"Home ({home_name or 'Home'})", f"Away ({away_name or 'Away'})"])
             line = st.number_input("Line (home-based; -3.5 = Home -3.5)", value=0.0, step=0.5, format="%.1f")
             odds_str = st.text_input("Price (American, optional)", value="")
             pick = f"{side} {line:+g}"
@@ -750,7 +769,7 @@ with tabs[2]:
             odds_str = st.text_input("Price (American, optional)", value="")
             pick = f"{ou} {line:g}"
         else:
-            side = st.selectbox("Side", [f"Home ({home})", f"Away ({away})"])
+            side = st.selectbox("Side", [f"Home ({home_name or 'Home'})", f"Away ({away_name or 'Away'})"])
             odds_str = st.text_input("Price (American, optional)", value="")
             pick = f"{side} ML {odds_str or ''}".strip()
 
@@ -766,40 +785,61 @@ with tabs[2]:
 
     if submit:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Model fields only if we have data; otherwise None/empty
+        ms = round(model_spread, 2) if has_data else None
+        mt = round(model_total, 2) if has_data else None
+        bs = round(blend_spread, 2) if has_data else None
+        bt = round(blend_total, 2) if has_data else None
+        rec_txt = (f"{recommendation['confidence']} — {recommendation['label']}") if has_data else ""
+        ev_best = round(recommendation["ev"], 3) if has_data else None
+
         row = {
-            "timestamp": ts, "bettor": bettor, "home": home, "away": away,
-            "bet_type": bet_type, "pick": pick, "odds": odds_val, "stake": float(stake),
-            "model_spread": round(model_spread, 2), "model_total": round(model_total, 2),
-            "blended_spread": round(blend_spread, 2), "blended_total": round(blend_total, 2),
-            "recommendation": f"{recommendation['confidence']} — {recommendation['label']}",
-            "ev_best": round(recommendation["ev"], 3),
-            "description": description, "result": "pending",
+            "timestamp": ts,
+            "bettor": bettor,
+            "home": home_name or "",
+            "away": away_name or "",
+            "bet_type": bet_type,
+            "pick": pick,
+            "odds": odds_val,
+            "stake": float(stake),
+            "model_spread": ms,
+            "model_total": mt,
+            "blended_spread": bs,
+            "blended_total": bt,
+            "recommendation": rec_txt,
+            "ev_best": ev_best,
+            "description": description,
+            "result": "pending",
             "room": _room(),
         }
         if persist_row(row, "bet_logs"):
             st.success("Bet saved.")
+
         if notify:
             odds_txt = f"{int(odds_val):+d}" if odds_val is not None else "—"
-            sep = "────────────────────────────────"  # separator line
-
+            sep = "────────────────────────────────"
             note_line = f"Note: {description}\n" if (description and str(description).strip()) else ""
 
-            msg = (
-                f"{sep}\n"
-                f"🚨 **{bettor}'s New Bet** 🚨\n"
-                f"Game: {home} vs {away}\n"
-                f"\n"
-                f"{bet_type}: {pick} @ {odds_txt}\n"
-                f"Stake: {stake}u\n"
-                f"\n"
-                f"Blend: spread {blend_spread:+.2f}, total {blend_total:.2f}\n"
-                f"Reco: {recommendation['confidence']} — {recommendation['label']}\n"
-                f"\n"
-                f"{note_line}"
-                f"{sep}"
-            )
+            lines = [
+                sep,
+                f"🚨 **{bettor}'s New Bet** 🚨",
+                f"Game: {home_name or 'Home'} vs {away_name or 'Away'}",
+                "",
+                f"{bet_type}: {pick} @ {odds_txt}",
+                f"Stake: {stake}u",
+            ]
+            if has_data:
+                lines += [
+                    "",
+                    f"Blend: spread {bs:+.2f}, total {bt:.2f}",
+                    f"Reco: {recommendation['confidence']} — {recommendation['label']}",
+                ]
+            if note_line:
+                lines += ["", note_line.strip()]
+            lines.append(sep)
 
-            ok, detail = notify_discord(msg)
+            ok, detail = notify_discord("\n".join(lines))
             st.info(f"Discord: {'sent' if ok else 'not sent'} ({detail})")
 
         st.rerun()
@@ -808,21 +848,23 @@ with tabs[2]:
 with tabs[3]:
     st.markdown("### Save / Manage Projections")
 
-    # Save current projection summary
-    if st.button("💾 Save Current Projection Summary"):
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        row = {
-            "timestamp": ts, "home": home, "away": away, "room": _room(),
-            "proj_home": round(proj_home, 1), "proj_away": round(proj_away, 1),
-            "model_spread": round(model_spread, 2), "model_total": round(model_total, 2),
-            "blended_spread": round(blend_spread, 2), "blended_total": round(blend_total, 2),
-            "winner": winner, "recommendation": f"{recommendation['confidence']} — {recommendation['label']}",
-            "ev_best": round(recommendation["ev"], 3), "weather_mult": round(w_mult, 3),
-            "hfa_points": float(hfa_pts), "n_sims": int(n_sims), "seed": int(seed),
-        }
-        if persist_row(row, "saved_projections"):
-            st.success("Projection saved.")
-        st.rerun()
+    if has_data:
+        if st.button("💾 Save Current Projection Summary"):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            row = {
+                "timestamp": ts, "home": home, "away": away, "room": _room(),
+                "proj_home": round(proj_home, 1), "proj_away": round(proj_away, 1),
+                "model_spread": round(model_spread, 2), "model_total": round(model_total, 2),
+                "blended_spread": round(blend_spread, 2), "blended_total": round(blend_total, 2),
+                "winner": winner, "recommendation": f"{recommendation['confidence']} — {recommendation['label']}",
+                "ev_best": round(recommendation["ev"], 3), "weather_mult": round(weather_multiplier(temp_f, wind_mph, precip, indoor), 3),
+                "hfa_points": float(0.0 if neutral else hfa), "n_sims": int(n_sims), "seed": int(seed),
+            }
+            if persist_row(row, "saved_projections"):
+                st.success("Projection saved.")
+            st.rerun()
+    else:
+        st.info("Upload a CSV to save new projections. You can still view and manage previously saved items below.")
 
     proj_df = load_table("saved_projections")
 
