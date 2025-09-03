@@ -66,6 +66,20 @@ SAVED_PROJ_COLS = [
 
 LOCAL_SETTINGS_FILE = "model_settings.json"
 
+def select_with_state(label, options, key, default_index=0):
+    """Use session state if present; otherwise fall back to default_index."""
+    if key in st.session_state and st.session_state[key] in options:
+        return st.selectbox(label, options, key=key)
+    safe_idx = min(default_index, max(len(options) - 1, 0)) if options else 0
+    return st.selectbox(label, options, index=safe_idx, key=key)
+
+def toggle_with_state(label, key, default=False):
+    """Use session state if present; otherwise fall back to default."""
+    if key in st.session_state:
+        return st.toggle(label, key=key)
+    return st.toggle(label, value=default, key=key)
+
+
 # =============================== Supabase helpers ===============================
 def _supabase_client() -> Optional[Client]:
     # If your secret is SB_SERVICE_ROLE_KEY, either duplicate it as SB_SERVICE_KEY or change the next line.
@@ -432,15 +446,23 @@ else:
         team_list = sorted(df_z["team"].unique().tolist())
         has_data = True
 
+# --- Apply any queued state from "Load" (must happen before widgets render) ---
+if "_queued_state" in st.session_state:
+    st.session_state.update(st.session_state.pop("_queued_state"))
+
 # =============================== Sticky matchup ===============================
 if has_data:
     st.markdown('<div class="sticky-wrap">', unsafe_allow_html=True)
     t1, t2, t3 = st.columns([1.2, 1.2, 0.6])
-    with t1: home = st.selectbox("Home team", team_list, key="home_team_top")
-    with t2: away = st.selectbox("Away team", team_list, index=1 if len(team_list) > 1 else 0, key="away_team_top")
+    with t1:
+        home = select_with_state("Home team", team_list, "home_team_top", default_index=0)
+    with t2:
+        away_default = 1 if len(team_list) > 1 else 0
+        away = select_with_state("Away team", team_list, "away_team_top", default_index=away_default)
     with t3:
         cA, cB = st.columns(2)
-        with cB: neutral = st.toggle("Neutral", value=False, key="neutral_key")
+        with cB:
+            neutral = toggle_with_state("Neutral", key="neutral_toggle", default=False)
     st.markdown('</div>', unsafe_allow_html=True)
     if home == away: st.warning("Pick two different teams."); st.stop()
 else:
@@ -932,63 +954,81 @@ def save_projection_to_supabase(row: dict) -> bool:
 
 def load_projection_into_controls(rec: dict):
     """
-    Populate UI controls from a saved_projections row (dict-like).
-    Uses 'context' JSON if present; otherwise reconstructs market lines from blended/model using current weight.
+    Prepare a payload of state values from a saved projection and queue it to be
+    applied on the next run (before widgets are instantiated).
     """
+    payload = {}
+
     # Teams
-    if rec.get("home"): st.session_state["home_team_top"] = rec["home"]
-    if rec.get("away"): st.session_state["away_team_top"] = rec["away"]
+    if rec.get("home"):
+        payload["home_team_top"] = rec["home"]
+    if rec.get("away"):
+        payload["away_team_top"] = rec["away"]
 
-    # Base/HFA
+    # HFA / neutral / sim settings
     hfa_pts = float(rec.get("hfa_points") or 0.0)
-    st.session_state["neutral_key"] = (abs(hfa_pts) < 1e-9)
-    st.session_state["hfa_key"] = hfa_pts
-    if rec.get("n_sims") is not None: st.session_state["n_sims_key"] = int(rec["n_sims"])
-    if rec.get("seed")   is not None: st.session_state["seed_key"]   = int(rec["seed"])
+    payload["neutral_key"] = (abs(hfa_pts) < 1e-9)
+    payload["hfa_key"] = hfa_pts
+    if rec.get("n_sims") is not None:
+        payload["n_sims_key"] = int(rec["n_sims"])
+    if rec.get("seed") is not None:
+        payload["seed_key"] = int(rec["seed"])
 
-    # Context JSON (if present)
+    # Use context JSON when present
     ctx = rec.get("context")
     if isinstance(ctx, str):
-        try: ctx = json.loads(ctx)
-        except Exception: ctx = None
+        try:
+            ctx = json.loads(ctx)
+        except Exception:
+            ctx = None
 
     if isinstance(ctx, dict):
         mkt = ctx.get("market") or {}
         wx  = ctx.get("weather") or {}
         sim = ctx.get("simulation") or {}
-        if "weight" in mkt: st.session_state["market_weight_key"] = float(mkt["weight"])
-        if "spread_home" in mkt: st.session_state["market_spread_key"] = float(mkt["spread_home"])
-        if "total" in mkt: st.session_state["market_total_key"] = float(mkt["total"])
-        if "spread_odds" in mkt: st.session_state["spread_odds_key"] = int(mkt["spread_odds"])
-        if "total_odds" in mkt: st.session_state["total_odds_key"] = int(mkt["total_odds"])
-        if "indoor" in wx: st.session_state["indoor_key"] = bool(wx["indoor"])
-        if "temp_f" in wx: st.session_state["temp_key"] = float(wx["temp_f"])
-        if "wind_mph" in wx: st.session_state["wind_key"] = float(wx["wind_mph"])
-        if "precip" in wx: st.session_state["precip_key"] = str(wx["precip"])
-        if "neutral" in wx: st.session_state["neutral_key"] = bool(wx["neutral"])
-        if "hfa_points" in wx: st.session_state["hfa_key"] = float(wx["hfa_points"])
-        if "n_sims" in sim: st.session_state["n_sims_key"] = int(sim["n_sims"])
-        if "seed" in sim: st.session_state["seed_key"] = int(sim["seed"])
-        if "spread_method" in sim: st.session_state["spread_method_key"] = str(sim["spread_method"])
+
+        # Market
+        if "weight" in mkt:       payload["market_weight_key"] = float(mkt["weight"])
+        if "spread_home" in mkt:  payload["market_spread_key"] = float(mkt["spread_home"])
+        if "total" in mkt:        payload["market_total_key"]  = float(mkt["total"])
+        if "spread_odds" in mkt:  payload["spread_odds_key"]   = int(mkt["spread_odds"])
+        if "total_odds" in mkt:   payload["total_odds_key"]    = int(mkt["total_odds"])
+
+        # Weather
+        if "indoor" in wx:        payload["indoor_key"]        = bool(wx["indoor"])
+        if "temp_f" in wx:        payload["temp_key"]          = float(wx["temp_f"])
+        if "wind_mph" in wx:      payload["wind_key"]          = float(wx["wind_mph"])
+        if "precip" in wx:        payload["precip_key"]        = str(wx["precip"])
+        if "neutral" in wx:       payload["neutral_key"]       = bool(wx["neutral"])
+        if "hfa_points" in wx:    payload["hfa_key"]           = float(wx["hfa_points"])
+
+        # Simulation
+        if "n_sims" in sim:       payload["n_sims_key"]        = int(sim["n_sims"])
+        if "seed" in sim:         payload["seed_key"]          = int(sim["seed"])
+        if "spread_method" in sim:payload["spread_method_key"] = str(sim["spread_method"])
     else:
-        # Reconstruct markets from blended & model using current weight
+        # Best-effort reconstruction if no context saved
         try:
-            w = float(st.session_state.get("market_weight_key", 0.35))
+            w  = float(st.session_state.get("market_weight_key", 0.35))
             ms = float(rec.get("model_spread"))
             bs = float(rec.get("blended_spread"))
-            if w > 0: st.session_state["market_spread_key"] = (bs - (1.0 - w)*ms) / w
+            if w > 0:
+                payload["market_spread_key"] = (bs - (1.0 - w)*ms) / w
         except Exception:
             pass
         try:
-            w = float(st.session_state.get("market_weight_key", 0.35))
+            w  = float(st.session_state.get("market_weight_key", 0.35))
             mt = float(rec.get("model_total"))
             bt = float(rec.get("blended_total"))
-            if w > 0: st.session_state["market_total_key"] = (bt - (1.0 - w)*mt) / w
+            if w > 0:
+                payload["market_total_key"] = (bt - (1.0 - w)*mt) / w
         except Exception:
             pass
 
-    st.success("Loaded into controls. Switch to the **Adjustments** tab to simulate.")
+    # Queue updates for next run (so widgets pick them up as initial values)
+    st.session_state["_queued_state"] = payload
     st.rerun()
+
 
 with tabs[3]:
     st.markdown("### Save / Manage Projections")
