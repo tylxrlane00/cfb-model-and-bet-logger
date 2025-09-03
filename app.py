@@ -348,33 +348,67 @@ def simulate_scores(mu_home, mu_away, sd_home, sd_away, n_sims, seed):
 
 def cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, spread_odds, total_odds):
     margin = home_scores - away_scores
-    total = home_scores + away_scores
-    k = market_spread_home
-    k_is_int = abs(k - round(k)) < 1e-9
+    total  = home_scores + away_scores
+
+    # --- Home spread evaluation (line is home-based; negative = home favored)
+    L_home = float(market_spread_home)
+    thresh = -L_home  # cover iff margin > thresh
+
+    k_is_int = abs(thresh - round(thresh)) < 1e-9
     if k_is_int:
-        p_home_push = float(np.mean(margin == int(round(k))))
-        p_home_cover = float(np.mean(margin > k))
-        p_home_lose = max(0.0, 1.0 - p_home_cover - p_home_push)
+        p_home_push  = float(np.mean(margin == int(round(thresh))))
+        p_home_cover = float(np.mean(margin >  thresh))
     else:
-        p_home_push = 0.0; p_home_cover = float(np.mean(margin > k)); p_home_lose = 1.0 - p_home_cover
-    t = market_total
+        p_home_push  = 0.0
+        p_home_cover = float(np.mean(margin >  thresh))
+    p_home_lose = max(0.0, 1.0 - p_home_cover - p_home_push)
+
+    # --- Total evaluation
+    t = float(market_total)
     t_is_int = abs(t - round(t)) < 1e-9
     if t_is_int:
         p_over_push = float(np.mean(total == int(round(t))))
-        p_over = float(np.mean(total > t))
-        p_under = max(0.0, 1.0 - p_over - p_over_push)
+        p_over      = float(np.mean(total > t))
     else:
-        p_over_push = 0.0; p_over = float(np.mean(total > t)); p_under = 1.0 - p_over
+        p_over_push = 0.0
+        p_over      = float(np.mean(total > t))
+    p_under = max(0.0, 1.0 - p_over - p_over_push)
+
     return {
-        "p_home_cover": p_home_cover, "p_home_push": p_home_push, "p_away_cover": p_home_lose,
+        "p_home_cover":  p_home_cover,
+        "p_home_push":   p_home_push,
+        "p_away_cover":  p_home_lose,
         "ev_home_spread": ev_from_p(p_home_cover, spread_odds, p_home_push),
         "ev_away_spread": ev_from_p(p_home_lose,  spread_odds, p_home_push),
-        "p_over": p_over, "p_over_push": p_over_push, "p_under": p_under,
-        "ev_over": ev_from_p(p_over,  total_odds, p_over_push),
+        "p_over":   p_over,
+        "p_over_push": p_over_push,
+        "p_under":  p_under,
+        "ev_over":  ev_from_p(p_over,  total_odds, p_over_push),
         "ev_under": ev_from_p(p_under, total_odds, p_over_push),
         "home_win": float(np.mean(margin > 0.0) + 0.5*np.mean(margin == 0.0)),
         "away_win": float(np.mean(margin < 0.0) + 0.5*np.mean(margin == 0.0)),
     }
+
+def two_sided_spread_text(spread: float, home_name: str, away_name: str) -> tuple[str, str, str]:
+    """
+    spread is H−A (negative = home fav). Returns:
+    (favorite_line_text, home_line_text, away_line_text)
+    e.g. (-5.13, 'Home -5.13 / Away +5.13', 'Home -5.13', 'Away +5.13')
+    """
+    v = abs(spread)
+    if spread < 0:
+        fav = f"{home_name} by {v:.2f}"
+        home_line = f"-{v:.2f}"
+        away_line = f"+{v:.2f}"
+    elif spread > 0:
+        fav = f"{away_name} by {v:.2f}"
+        home_line = f"+{v:.2f}"
+        away_line = f"-{v:.2f}"
+    else:
+        fav = "Pick’em"
+        home_line = away_line = "PK"
+    return fav, f"Home {home_line} / Away {away_line}", home_line
+
 
 def choose_recommendation(metrics, market_spread_home, market_total):
     candidates = [
@@ -598,11 +632,19 @@ if has_data:
         st.metric(home, f"{proj_home:.1f}"); st.metric(away, f"{proj_away:.1f}")
         st.caption(f"Median: {home} {np.median(home_scores):.0f} — {away} {np.median(away_scores):.0f}")
     with c2:
-        st.subheader("Model Lines"); st.metric("Spread (H−A)", f"{model_spread:+.2f}"); st.metric("Total", f"{model_total:.2f}")
-        st.caption("Negative spread ⇒ Home favored.")
+        st.subheader("Model Lines")
+        st.metric("Spread (H−A)", f"{model_spread:+.2f}")
+        fav_text, home_away_text, _ = two_sided_spread_text(model_spread, home, away)
+        st.caption(f"{home_away_text} • Favorite: {fav_text}")
+        st.metric("Total", f"{model_total:.2f}")
     with c3:
-        st.subheader("Market-Blended Lines"); st.metric("Blended Spread", f"{blend_spread:+.2f}"); st.metric("Blended Total", f"{blend_total:.2f}")
+        st.subheader("Market-Blended Lines")
+        st.metric("Blended Spread", f"{blend_spread:+.2f}")
+        fav_text_b, home_away_text_b, _ = two_sided_spread_text(blend_spread, home, away)
+        st.caption(f"{home_away_text_b} • Favorite: {fav_text_b}")
+        st.metric("Blended Total", f"{blend_total:.2f}")
         st.caption(f"Blend: {100*(1-market_weight):.0f}% model / {100*market_weight:.0f}% market")
+
 
     st.divider()
     a,b,c,d,e = st.columns(5)
