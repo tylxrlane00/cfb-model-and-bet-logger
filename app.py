@@ -481,7 +481,7 @@ with tabs[0]:
             market_total = st.number_input("Market Total", value=52.5, step=0.5, format="%.1f")
             spread_odds = st.number_input("Spread Price (American)", value=-110, step=5)
             total_odds = st.number_input("Total Price (American)", value=-110, step=5)
-            market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.35, 0.05)
+            market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.5, 0.05)
             n_sims = st.slider("Number of Simulations", 1000, 50000, 10000, 1000)
             seed = st.number_input("Random Seed", value=42, step=1)
 
