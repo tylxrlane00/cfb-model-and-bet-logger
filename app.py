@@ -1,4 +1,4 @@
-# app.py — CFB PPA Monte Carlo Predictor + Supabase + Bet Board + Projections Manager + Tuning
+# app.py — CFB PPA Monte Carlo Predictor + Market Blend + EV + Bet Board + Projections Manager
 # Run locally:  pip install streamlit pandas numpy requests supabase python-dateutil && streamlit run app.py
 
 import os, io, json, time
@@ -11,11 +11,13 @@ from supabase import create_client, Client
 
 # =============================== Defaults ===============================
 DEFAULT_BASE = {
-    "BASE_TEAM_POINTS": 27.0,
-    "RATING_SCALE_TO_POINTS": 7.5,
+    "BASE_TEAM_POINTS": 27.0,      # used when CSV mu_pts is not present
+    "RATING_SCALE_TO_POINTS": 7.5, # rating sd => points scaling (used for both legacy & ratings)
     "MIN_SD_POINTS": 10.0,
     "MAX_SD_POINTS": 24.0,
 }
+
+# Legacy model weights (used if ratings columns are missing)
 DEFAULT_OFF_WEIGHTS = {
     "offense.ppa": 0.35,
     "offense.successRate": 0.20,
@@ -41,6 +43,7 @@ DEFAULT_DEF_WEIGHTS = {
     "defense.passingPlays.ppa": -0.025,
 }
 
+# Required columns (legacy component features)
 REQUIRED_COLUMNS = [
     "team",
     "offense.ppa","offense.successRate","offense.explosiveness",
@@ -50,6 +53,13 @@ REQUIRED_COLUMNS = [
     "defense.ppa","defense.successRate","defense.explosiveness","defense.powerSuccess",
     "defense.stuffRate","defense.pointsPerOpportunity","defense.fieldPosition.averageStart",
     "defense.havoc.total","defense.rushingPlays.ppa","defense.passingPlays.ppa",
+]
+
+# Optional new columns coming from build_weekly_team_csv.py (ratings/volatility)
+OPTIONAL_NEW_COLS = [
+    "off_rating", "def_rating",   # opponent-adjusted ratings
+    "mu_pts", "hfa_pts",          # league baseline & HFA estimate (reference)
+    "vol_points", "games_played"  # team point volatility & GP
 ]
 
 BET_LOG_COLS = [
@@ -70,6 +80,7 @@ LOCAL_SETTINGS_FILE = "model_settings.json"
 
 # =============================== Supabase helpers ===============================
 def _supabase_client() -> Optional[Client]:
+    # If SB_SERVICE_KEY not set, we quietly use CSV persistence
     url = st.secrets.get("SB_URL")
     key = st.secrets.get("SB_SERVICE_KEY") or st.secrets.get("SB_SERVICE_ROLE_KEY")
     if not url or not key:
@@ -82,6 +93,7 @@ def persistence_mode():
 def _room() -> str:
     return st.session_state.get("room", st.secrets.get("ROOM", "main"))
 
+# Settings persistence (Supabase JSON or local JSON)
 def load_settings() -> Tuple[Dict, Dict, Dict]:
     sb = _supabase_client()
     if sb:
@@ -103,6 +115,7 @@ def load_settings() -> Tuple[Dict, Dict, Dict]:
                     )
         except Exception:
             st.info("Using default model settings (Supabase settings table missing).")
+    # Local file fallback
     if os.path.exists(LOCAL_SETTINGS_FILE):
         try:
             with open(LOCAL_SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -137,6 +150,7 @@ def save_settings(base_params: Dict, off_weights: Dict, def_weights: Dict) -> bo
                 return True
         except Exception as e:
             st.warning(f"Supabase settings insert failed: {e}")
+    # Local fallback
     try:
         with open(LOCAL_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -145,6 +159,7 @@ def save_settings(base_params: Dict, off_weights: Dict, def_weights: Dict) -> bo
         st.error(f"Failed to save local settings: {e}")
         return False
 
+# Generic row persistence (Supabase then CSV fallback)
 def persist_row(row: dict, table: str) -> bool:
     mode = persistence_mode()
     row = dict(row); row.setdefault("room", _room())
@@ -158,6 +173,7 @@ def persist_row(row: dict, table: str) -> bool:
             return True
         except Exception as e:
             st.warning(f"Supabase insert failed, falling back to CSV: {e}")
+    # CSV fallback (append)
     try:
         path = f"{table}.csv"
         df = pd.DataFrame([row])
@@ -234,6 +250,7 @@ def load_table(table: str) -> pd.DataFrame:
                 st.warning(f"Failed to read {path}: {e}"); df = _empty_table(table)
         else:
             df = _empty_table(table)
+    # Ensure schema for local CSV
     cols = BET_LOG_COLS if table == "bet_logs" else (SAVED_PROJ_COLS if table == "saved_projections" else [])
     for c in cols:
         if c not in df.columns: df[c] = pd.Series(dtype="object")
@@ -279,10 +296,16 @@ def load_csv(uploaded):
 
 def coerce_and_impute(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for c in [c for c in REQUIRED_COLUMNS if c != "team"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-    med = df[[c for c in REQUIRED_COLUMNS if c != "team"]].median(numeric_only=True)
-    df[[c for c in REQUIRED_COLUMNS if c != "team"]] = df[[c for c in REQUIRED_COLUMNS if c != "team"]].fillna(med)
+    # Coerce both required & optional numeric columns
+    numeric_cols = [c for c in REQUIRED_COLUMNS if c != "team"] + [c for c in OPTIONAL_NEW_COLS if c not in ["team","precip"]]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Impute only legacy required metrics (ratings may be sparse early season)
+    med = df[[c for c in REQUIRED_COLUMNS if c != "team" and c in df.columns]].median(numeric_only=True)
+    for c in REQUIRED_COLUMNS:
+        if c != "team" and c in df.columns:
+            df[c] = df[c].fillna(med.get(c, 0.0))
     return df
 
 def zscore_columns(df: pd.DataFrame, cols: list) -> pd.DataFrame:
@@ -290,7 +313,7 @@ def zscore_columns(df: pd.DataFrame, cols: list) -> pd.DataFrame:
     for c in cols:
         if c in out.columns:
             m = out[c].mean(); s = out[c].std(ddof=0)
-            out[c+"__z"] = 0.0 if not s else (out[c] - m) / s
+            out[c+"__z"] = 0.0 if (s is None or s == 0 or not np.isfinite(s)) else (out[c] - m) / s
             out[c+"__z"] = out[c+"__z"].fillna(0.0)
     return out
 
@@ -424,7 +447,7 @@ with st.sidebar:
     st.session_state["room"] = st.text_input("Room (namespace)", value=st.secrets.get("ROOM", "main"))
     st.caption(f"Persistence: **{persistence_mode()}** (room: `{_room()}`)")
 
-# Always load settings so Tuning can work without data
+# Always load settings so Tuning works without data
 BASE, OFF_WEIGHTS, DEF_WEIGHTS = load_settings()
 
 # Determine whether we have valid data for simulations
@@ -437,8 +460,19 @@ else:
         st.warning(f"CSV missing required columns: {missing}. Logging-only mode enabled.")
     else:
         df = coerce_and_impute(df)
+
+        # Ratings mode if new columns exist
+        HAS_RATINGS = all(c in df.columns for c in ["off_rating", "def_rating"])
+
+        # Build z-scores for legacy component model & tuning UI
         zcols = list(set(list(OFF_WEIGHTS.keys()) + list(DEF_WEIGHTS.keys())))
         df_z = zscore_columns(df, zcols)
+
+        # Also carry over ratings/vol columns (as-is) so we can read them from the same df_z
+        for c in OPTIONAL_NEW_COLS:
+            if c in df.columns and c not in df_z.columns:
+                df_z[c] = df[c]
+
         team_list = sorted(df_z["team"].unique().tolist())
         has_data = True
 
@@ -474,6 +508,15 @@ with tabs[0]:
             wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, disabled=indoor)
             precip = st.select_slider("Precipitation", ["None","Light","Moderate","Heavy"], value="None", disabled=indoor)
             hfa = 0.0 if neutral else st.slider("Home Field Advantage (pts)", 0.0, 6.0, 2.5, 0.5)
+
+            # Show CSV league HFA as a reference if present
+            if "hfa_pts" in df_z.columns:
+                try:
+                    hfa_ref = float(pd.to_numeric(df_z["hfa_pts"], errors="coerce").dropna().median())
+                    st.caption(f"CSV league HFA reference: {hfa_ref:.2f} pts")
+                except Exception:
+                    pass
+
         with right:
             st.subheader("Market & Simulation")
             st.caption("Spread inputs are **home-based** (negative = home favored).")
@@ -493,10 +536,10 @@ with tabs[1]:
     with t_left:
         st.markdown("##### Base Parameters")
         base_edit = {}
-        base_edit["BASE_TEAM_POINTS"] = st.number_input("Baseline team points", value=float(BASE["BASE_TEAM_POINTS"]), step=0.5)
-        base_edit["RATING_SCALE_TO_POINTS"] = st.number_input("Scale: z-diff → points", value=float(BASE["RATING_SCALE_TO_POINTS"]), step=0.25)
-        base_edit["MIN_SD_POINTS"] = st.number_input("Min SD (points)", value=float(BASE["MIN_SD_POINTS"]), step=0.5)
-        base_edit["MAX_SD_POINTS"] = st.number_input("Max SD (points)", value=float(BASE["MAX_SD_POINTS"]), step=0.5)
+        base_edit["BASE_TEAM_POINTS"] = st.number_input("Baseline team points", value=float(DEFAULT_BASE["BASE_TEAM_POINTS"]), step=0.5)
+        base_edit["RATING_SCALE_TO_POINTS"] = st.number_input("Scale: z/rating diff → points", value=float(DEFAULT_BASE["RATING_SCALE_TO_POINTS"]), step=0.25)
+        base_edit["MIN_SD_POINTS"] = st.number_input("Min SD (points)", value=float(DEFAULT_BASE["MIN_SD_POINTS"]), step=0.5)
+        base_edit["MAX_SD_POINTS"] = st.number_input("Max SD (points)", value=float(DEFAULT_BASE["MAX_SD_POINTS"]), step=0.5)
 
     def _weights_editor(title: str, weights: Dict) -> Dict:
         st.markdown(f"##### {title}")
@@ -522,8 +565,8 @@ with tabs[1]:
         return out
 
     with t_right:
-        off_new = _weights_editor("Offense Weights", DEFAULT_OFF_WEIGHTS | OFF_WEIGHTS)
-        def_new = _weights_editor("Defense Weights", DEFAULT_DEF_WEIGHTS | DEF_WEIGHTS)
+        off_new = _weights_editor("Offense Weights", DEFAULT_OFF_WEIGHTS)
+        def_new = _weights_editor("Defense Weights", DEFAULT_DEF_WEIGHTS)
 
     st.markdown("---")
     t1, _ = st.columns([1,3])
@@ -532,28 +575,62 @@ with tabs[1]:
             ok = save_settings(base_edit, off_new, def_new)
             if ok: st.success("Saved model settings."); st.rerun()
             else: st.error("Could not save settings.")
-    st.caption("Weights do not need to sum to 1, but normalization helps comparability. Defense weights may be negative where lower is better (e.g., success rate).")
+    st.caption("Weights used only if ratings columns are missing. Defense weights may be negative where lower is better.")
 
 # =============================== Model compute & Summary (only with data) ===============================
 if has_data:
-    home_row = team_row(df_z, home); away_row = team_row(df_z, away)
-    home_off = composite_rating(home_row, OFF_WEIGHTS); home_def = composite_rating(home_row, DEF_WEIGHTS)
-    away_off = composite_rating(away_row, OFF_WEIGHTS); away_def = composite_rating(away_row, DEF_WEIGHTS)
+    home_row = team_row(df_z, home)
+    away_row = team_row(df_z, away)
 
-    mu_home_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (home_off - away_def)
-    mu_away_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (away_off - home_def)
-    hfa_pts = 0.0 if neutral else hfa
-    mu_home_raw += hfa_pts/2.0; mu_away_raw -= hfa_pts/2.0
+    # 1) Ratings vs legacy composites
+    if 'HAS_RATINGS' in locals() and HAS_RATINGS:
+        home_off = float(home_row.get("off_rating", 0.0))
+        home_def = float(home_row.get("def_rating", 0.0))
+        away_off = float(away_row.get("off_rating", 0.0))
+        away_def = float(away_row.get("def_rating", 0.0))
+        method_label = "Ratings"
+    else:
+        home_off = composite_rating(home_row, DEFAULT_OFF_WEIGHTS)
+        home_def = composite_rating(home_row, DEFAULT_DEF_WEIGHTS)
+        away_off = composite_rating(away_row, DEFAULT_OFF_WEIGHTS)
+        away_def = composite_rating(away_row, DEFAULT_DEF_WEIGHTS)
+        method_label = "Weighted components"
 
+    # 2) Baseline scoring level & HFA
+    mu_base_home = float(home_row.get("mu_pts", DEFAULT_BASE["BASE_TEAM_POINTS"]))
+    mu_base_away = float(away_row.get("mu_pts", DEFAULT_BASE["BASE_TEAM_POINTS"]))
+    mu_base = 0.5 * (mu_base_home + mu_base_away)
+    pts_per_sd = float(DEFAULT_BASE["RATING_SCALE_TO_POINTS"])
+
+    mu_home_raw = mu_base + pts_per_sd * (home_off - away_def)
+    mu_away_raw = mu_base + pts_per_sd * (away_off - home_def)
+
+    # Apply UI HFA (you can add CSV hfa_pts if desired)
+    hfa_pts_ui = 0.0 if neutral else float(hfa)
+    mu_home_raw += hfa_pts_ui / 2.0
+    mu_away_raw -= hfa_pts_ui / 2.0
+
+    # 3) Weather impact
     w_mult = weather_multiplier(temp_f, wind_mph, precip, indoor)
+    mu_home = mu_home_raw * w_mult
+    mu_away = mu_away_raw * w_mult
 
-    mu_home = mu_home_raw * w_mult; mu_away = mu_away_raw * w_mult
-    sd_home = volatility_sd_dyn(home_row, away_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
-    sd_away = volatility_sd_dyn(away_row, home_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
+    # 4) Volatility from CSV or fallback
+    if "vol_points" in df_z.columns:
+        sd_home = float(np.clip(home_row.get("vol_points", DEFAULT_BASE["MIN_SD_POINTS"]),
+                                DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"]))
+        sd_away = float(np.clip(away_row.get("vol_points", DEFAULT_BASE["MIN_SD_POINTS"]),
+                                DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"]))
+    else:
+        sd_home = volatility_sd_dyn(home_row, away_row, DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"])
+        sd_away = volatility_sd_dyn(away_row, home_row, DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"])
+
     if not indoor:
-        sd_tighten = 1.0 - (1.0 - w_mult)*0.5
-        sd_home *= sd_tighten; sd_away *= sd_tighten
+        sd_tighten = 1.0 - (1.0 - w_mult) * 0.5
+        sd_home *= sd_tighten
+        sd_away *= sd_tighten
 
+    # 5) Simulate
     home_scores, away_scores = simulate_scores(mu_home, mu_away, sd_home, sd_away, int(n_sims), int(seed))
     margins = home_scores - away_scores; totals = home_scores + away_scores
 
@@ -604,7 +681,7 @@ if has_data:
         st.subheader("Model Lines")
         st.metric(f"{home} spread", f"{model_home_line:+.2f}")
         st.metric(f"{away} spread", f"{model_away_line:+.2f}")
-        st.caption("Betting-style (negative = favorite).")
+        st.caption(f"Betting-style (negative = favorite). Method: {method_label}.")
     with c3:
         st.subheader("Market-Blended Lines")
         st.metric(f"{home} spread", f"{blend_home_line:+.2f}")
@@ -658,6 +735,7 @@ with tabs[2]:
     st.markdown("### Bet Board")
     bet_df = load_table("bet_logs")
 
+    # Board names (from secrets or fallback)
     default_bettors: List[str] = st.secrets.get("BETTORS", [])
     if not default_bettors and "bettor" in bet_df.columns and not bet_df.empty:
         default_bettors = [b for b in bet_df["bettor"].dropna().unique().tolist()][:3]
@@ -858,8 +936,10 @@ with tabs[3]:
                 "model_spread": round(model_spread, 2), "model_total": round(model_total, 2),
                 "blended_spread": round(blend_spread, 2), "blended_total": round(blend_total, 2),
                 "winner": winner, "recommendation": f"{recommendation['confidence']} — {recommendation['label']}",
-                "ev_best": round(recommendation["ev"], 3), "weather_mult": round(weather_multiplier(temp_f, wind_mph, precip, indoor), 3),
+                "ev_best": round(recommendation["ev"], 3),
+                "weather_mult": round(weather_multiplier(temp_f, wind_mph, precip, indoor), 3),
                 "hfa_points": float(0.0 if neutral else hfa), "n_sims": int(n_sims), "seed": int(seed),
+                # extra saved context
                 "market_spread_home": float(market_spread_home),
                 "market_total": float(market_total),
                 "market_weight": float(market_weight),
@@ -886,6 +966,7 @@ with tabs[3]:
     with f3: sort_newest = st.toggle("Newest first", value=True)
 
     if not proj_df.empty:
+        # Filter & sort
         pdf = proj_df.copy()
         if filter_txt.strip():
             m = pdf["home"].fillna("").str.contains(filter_txt, case=False) | pdf["away"].fillna("").str.contains(filter_txt, case=False)
@@ -894,7 +975,7 @@ with tabs[3]:
         pdf = pdf.sort_values("ts_ord", ascending=not sort_newest, na_position="last").drop(columns=["ts_ord"])
         pdf = pdf.head(max_items)
 
-        # Grid cards (no Load button)
+        # Grid cards
         st.markdown('<div class="proj-grid">', unsafe_allow_html=True)
         for _, r in pdf.iterrows():
             rid = int(r.get("id", 0))
@@ -939,6 +1020,7 @@ with tabs[3]:
                 else:
                     st.warning("Check confirm to proceed.")
 
+        # Raw table + download
         st.dataframe(pdf, width="stretch")
         st.download_button(
             "⬇️ Download filtered (CSV)",
