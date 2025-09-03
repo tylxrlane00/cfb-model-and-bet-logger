@@ -1,12 +1,12 @@
 # app.py — CFB PPA Monte Carlo Predictor + Supabase + Bet Board + Projections Manager + Tuning
-# Run locally: pip install streamlit pandas numpy requests supabase python-dateutil && streamlit run app.py
+# Run locally:  pip install streamlit pandas numpy requests supabase python-dateutil && streamlit run app.py
 
 import os, io, json, time
 import numpy as np
 import pandas as pd
 import streamlit as st
 import requests
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Tuple
 from supabase import create_client, Client
 
 # =============================== Defaults ===============================
@@ -60,29 +60,16 @@ BET_LOG_COLS = [
 SAVED_PROJ_COLS = [
     "id","timestamp","room","home","away","proj_home","proj_away","model_spread",
     "model_total","blended_spread","blended_total","winner","recommendation","ev_best",
-    "weather_mult","hfa_points","n_sims","seed"
-    # + optional 'context' jsonb in Supabase (code handles absence gracefully)
+    "weather_mult","hfa_points","n_sims","seed",
+    # extra saved context
+    "market_spread_home","market_total","market_weight",
+    "spread_odds","total_odds","temp_f","wind_mph","precip","indoor","neutral",
 ]
 
 LOCAL_SETTINGS_FILE = "model_settings.json"
 
-def select_with_state(label, options, key, default_index=0):
-    """Use session state if present; otherwise fall back to default_index."""
-    if key in st.session_state and st.session_state[key] in options:
-        return st.selectbox(label, options, key=key)
-    safe_idx = min(default_index, max(len(options) - 1, 0)) if options else 0
-    return st.selectbox(label, options, index=safe_idx, key=key)
-
-def toggle_with_state(label, key, default=False):
-    """Use session state if present; otherwise fall back to default."""
-    if key in st.session_state:
-        return st.toggle(label, key=key)
-    return st.toggle(label, value=default, key=key)
-
-
 # =============================== Supabase helpers ===============================
 def _supabase_client() -> Optional[Client]:
-    # If your secret is SB_SERVICE_ROLE_KEY, either duplicate it as SB_SERVICE_KEY or change the next line.
     url = st.secrets.get("SB_URL")
     key = st.secrets.get("SB_SERVICE_KEY") or st.secrets.get("SB_SERVICE_ROLE_KEY")
     if not url or not key:
@@ -95,7 +82,6 @@ def persistence_mode():
 def _room() -> str:
     return st.session_state.get("room", st.secrets.get("ROOM", "main"))
 
-# Settings persistence (Supabase JSON or local JSON)
 def load_settings() -> Tuple[Dict, Dict, Dict]:
     sb = _supabase_client()
     if sb:
@@ -117,7 +103,6 @@ def load_settings() -> Tuple[Dict, Dict, Dict]:
                     )
         except Exception:
             st.info("Using default model settings (Supabase settings table missing).")
-    # Local fallback
     if os.path.exists(LOCAL_SETTINGS_FILE):
         try:
             with open(LOCAL_SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -152,7 +137,6 @@ def save_settings(base_params: Dict, off_weights: Dict, def_weights: Dict) -> bo
                 return True
         except Exception as e:
             st.warning(f"Supabase settings insert failed: {e}")
-    # Local fallback
     try:
         with open(LOCAL_SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -161,7 +145,6 @@ def save_settings(base_params: Dict, off_weights: Dict, def_weights: Dict) -> bo
         st.error(f"Failed to save local settings: {e}")
         return False
 
-# Generic persistence for bet_logs/saved_projections (CSV fallback)
 def persist_row(row: dict, table: str) -> bool:
     mode = persistence_mode()
     row = dict(row); row.setdefault("room", _room())
@@ -175,7 +158,6 @@ def persist_row(row: dict, table: str) -> bool:
             return True
         except Exception as e:
             st.warning(f"Supabase insert failed, falling back to CSV: {e}")
-    # CSV fallback (append)
     try:
         path = f"{table}.csv"
         df = pd.DataFrame([row])
@@ -252,7 +234,6 @@ def load_table(table: str) -> pd.DataFrame:
                 st.warning(f"Failed to read {path}: {e}"); df = _empty_table(table)
         else:
             df = _empty_table(table)
-
     cols = BET_LOG_COLS if table == "bet_logs" else (SAVED_PROJ_COLS if table == "saved_projections" else [])
     for c in cols:
         if c not in df.columns: df[c] = pd.Series(dtype="object")
@@ -358,32 +339,47 @@ def simulate_scores(mu_home, mu_away, sd_home, sd_away, n_sims, seed):
     home = np.nan_to_num(home, nan=0.0); away = np.nan_to_num(away, nan=0.0)
     return np.rint(home).astype(int), np.rint(away).astype(int)
 
-# --- Spread helpers -----------------------------------------------------------
-def fmt_home_line(spread_h_minus_a: float, home_name: str) -> str:
-    """Return 'HOME ±x.xx' from H−A spread."""
-    if abs(spread_h_minus_a) < 1e-12:
-        return f"{home_name} PK"
-    v = abs(spread_h_minus_a)
-    sign = "-" if spread_h_minus_a < 0 else "+"
-    return f"{home_name} {sign}{v:.2f}"
+def cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, spread_odds, total_odds):
+    margin = home_scores - away_scores
+    total = home_scores + away_scores
+    k = market_spread_home
+    k_is_int = abs(k - round(k)) < 1e-9
+    if k_is_int:
+        p_home_push = float(np.mean(margin == int(round(k))))
+        p_home_cover = float(np.mean(margin > k))
+        p_home_lose = max(0.0, 1.0 - p_home_cover - p_home_push)
+    else:
+        p_home_push = 0.0; p_home_cover = float(np.mean(margin > k)); p_home_lose = 1.0 - p_home_cover
+    t = market_total
+    t_is_int = abs(t - round(t)) < 1e-9
+    if t_is_int:
+        p_over_push = float(np.mean(total == int(round(t))))
+        p_over = float(np.mean(total > t))
+        p_under = max(0.0, 1.0 - p_over - p_over_push)
+    else:
+        p_over_push = 0.0; p_over = float(np.mean(total > t)); p_under = 1.0 - p_over
+    return {
+        "p_home_cover": p_home_cover, "p_home_push": p_home_push, "p_away_cover": p_home_lose,
+        "ev_home_spread": ev_from_p(p_home_cover, spread_odds, p_home_push),
+        "ev_away_spread": ev_from_p(p_home_lose,  spread_odds, p_home_push),
+        "p_over": p_over, "p_over_push": p_over_push, "p_under": p_under,
+        "ev_over": ev_from_p(p_over,  total_odds, p_over_push),
+        "ev_under": ev_from_p(p_under, total_odds, p_over_push),
+        "home_win": float(np.mean(margin > 0.0) + 0.5*np.mean(margin == 0.0)),
+        "away_win": float(np.mean(margin < 0.0) + 0.5*np.mean(margin == 0.0)),
+    }
 
-def spread_from_margin(margin_samples: np.ndarray, method: str) -> float:
-    """
-    Return model spread (H−A) using one of several methods.
-    method ∈ {'Mean', 'Median', 'Fair 50%', 'Fair 52.38%'}
-    'Fair p%': line L such that P(home cover at L) = p.
-    Home cover condition is margin > −L  ⇒ threshold t* = −L = quantile(1−p).
-    """
-    method = (method or "Mean").lower()
-    if method == "mean":
-        return float(np.mean(margin_samples))
-    if method == "median":
-        return float(np.median(margin_samples))
-    if method.startswith("fair"):
-        p = 0.50 if "50" in method else 0.5238
-        t_star = float(np.quantile(margin_samples, 1.0 - p))
-        return -t_star
-    return float(np.mean(margin_samples))
+def choose_recommendation(metrics, market_spread_home, market_total):
+    candidates = [
+        ("Home " + (f"{market_spread_home:+g}" if market_spread_home != 0 else "PK"),
+         metrics["ev_home_spread"], metrics["p_home_cover"]),
+        ("Away " + (f"{-market_spread_home:+g}" if market_spread_home != 0 else "PK"),
+         metrics["ev_away_spread"], metrics["p_away_cover"]),
+        (f"Over {market_total:g}", metrics["ev_over"], metrics["p_over"]),
+        (f"Under {market_total:g}", metrics["ev_under"], metrics["p_under"]),
+    ]
+    label, ev, p = max(candidates, key=lambda x: x[1])
+    return {"label": label, "ev": ev, "p": p, "confidence": bucket_confidence(ev, p)}
 
 # =============================== Page & Styles ===============================
 st.set_page_config(page_title="CFB Predictor — PPA Monte Carlo", layout="wide")
@@ -446,25 +442,19 @@ else:
         team_list = sorted(df_z["team"].unique().tolist())
         has_data = True
 
-# --- Apply any queued state from "Load" (must happen before widgets render) ---
-if "_queued_state" in st.session_state:
-    st.session_state.update(st.session_state.pop("_queued_state"))
-
 # =============================== Sticky matchup ===============================
 if has_data:
     st.markdown('<div class="sticky-wrap">', unsafe_allow_html=True)
     t1, t2, t3 = st.columns([1.2, 1.2, 0.6])
-    with t1:
-        home = select_with_state("Home team", team_list, "home_team_top", default_index=0)
-    with t2:
-        away_default = 1 if len(team_list) > 1 else 0
-        away = select_with_state("Away team", team_list, "away_team_top", default_index=away_default)
+    with t1: home = st.selectbox("Home team", team_list, index=0, key="home_team_top")
+    with t2: away = st.selectbox("Away team", team_list, index=1 if len(team_list) > 1 else 0, key="away_team_top")
     with t3:
         cA, cB = st.columns(2)
-        with cB:
-            neutral = toggle_with_state("Neutral", key="neutral_toggle", default=False)
+        with cB: neutral = st.toggle("Neutral", value=False)
     st.markdown('</div>', unsafe_allow_html=True)
-    if home == away: st.warning("Pick two different teams."); st.stop()
+    if home == away:
+        st.warning("Pick two different teams.")
+        st.stop()
 else:
     st.info("Logging-only mode: upload a CSV to unlock matchup sims & projections. Bet Logger works below.")
 
@@ -479,22 +469,21 @@ with tabs[0]:
         left, right = st.columns([1, 1], gap="large")
         with left:
             st.subheader("Weather & Context")
-            indoor = st.checkbox("Indoors / Roof Closed", value=False, key="indoor_key")
-            temp_f = st.slider("Temperature (°F)", -10, 110, 65, 1, disabled=indoor, key="temp_key")
-            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, disabled=indoor, key="wind_key")
-            precip = st.select_slider("Precipitation", ["None","Light","Moderate","Heavy"], value="None", disabled=indoor, key="precip_key")
-            hfa = 0.0 if st.session_state.get("neutral_key", False) else st.slider("Home Field Advantage (pts)", 0.0, 6.0, 2.5, 0.5, key="hfa_key")
+            indoor = st.checkbox("Indoors / Roof Closed", value=False)
+            temp_f = st.slider("Temperature (°F)", -10, 110, 65, 1, disabled=indoor)
+            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, disabled=indoor)
+            precip = st.select_slider("Precipitation", ["None","Light","Moderate","Heavy"], value="None", disabled=indoor)
+            hfa = 0.0 if neutral else st.slider("Home Field Advantage (pts)", 0.0, 6.0, 2.5, 0.5)
         with right:
             st.subheader("Market & Simulation")
-            st.caption("Spread input is **home-based** (negative = home favored).")
-            market_spread_home = st.number_input("Market Spread (Home perspective)", value=-3.0, step=0.5, format="%.1f", key="market_spread_key")
-            market_total = st.number_input("Market Total", value=52.5, step=0.5, format="%.1f", key="market_total_key")
-            spread_odds = st.number_input("Spread Price (American)", value=-110, step=5, key="spread_odds_key")
-            total_odds  = st.number_input("Total Price (American)",  value=-110, step=5, key="total_odds_key")
-            market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.35, 0.05, key="market_weight_key")
-            n_sims = st.slider("Number of Simulations", 1000, 50000, 10000, 1000, key="n_sims_key")
-            seed = st.number_input("Random Seed", value=42, step=1, key="seed_key")
-            spread_method = st.radio("Model spread method", ["Mean", "Median", "Fair 50%", "Fair 52.38%"], horizontal=True, key="spread_method_key")
+            st.caption("Spread inputs are **home-based** (negative = home favored).")
+            market_spread_home = st.number_input("Market Spread (Home perspective)", value=-3.0, step=0.5, format="%.1f")
+            market_total = st.number_input("Market Total", value=52.5, step=0.5, format="%.1f")
+            spread_odds = st.number_input("Spread Price (American)", value=-110, step=5)
+            total_odds = st.number_input("Total Price (American)", value=-110, step=5)
+            market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.35, 0.05)
+            n_sims = st.slider("Number of Simulations", 1000, 50000, 10000, 1000)
+            seed = st.number_input("Random Seed", value=42, step=1)
 
 # ---------- Tuning ----------
 with tabs[1]:
@@ -519,7 +508,7 @@ with tabs[1]:
                 out[str(r["metric"])] = float(r["weight"])
             except Exception:
                 out[str(r["metric"])] = 0.0
-        colA, colB, colC = st.columns(3)
+        colA, colB, _ = st.columns(3)
         with colA:
             if st.button(f"Normalize {title.split()[0]} weights"):
                 s = sum(abs(v) for v in out.values()) or 1.0
@@ -528,17 +517,16 @@ with tabs[1]:
         with colB:
             if st.button(f"Reset {title.split()[0]} to defaults"):
                 return DEFAULT_OFF_WEIGHTS.copy() if "Off" in title else DEFAULT_DEF_WEIGHTS.copy()
-        norm_key = f"norm_{title}"
-        if norm_key in st.session_state:
-            out = st.session_state.pop(norm_key)
+        if f"norm_{title}" in st.session_state:
+            out = st.session_state.pop(f"norm_{title}")
         return out
 
     with t_right:
-        off_new = _weights_editor("Offense Weights", DEFAULT_OFF_WEIGHTS if not has_data else DEFAULT_OFF_WEIGHTS | OFF_WEIGHTS)
-        def_new = _weights_editor("Defense Weights", DEFAULT_DEF_WEIGHTS if not has_data else DEFAULT_DEF_WEIGHTS | DEF_WEIGHTS)
+        off_new = _weights_editor("Offense Weights", DEFAULT_OFF_WEIGHTS | OFF_WEIGHTS)
+        def_new = _weights_editor("Defense Weights", DEFAULT_DEF_WEIGHTS | DEF_WEIGHTS)
 
     st.markdown("---")
-    t1, t2 = st.columns([1,3])
+    t1, _ = st.columns([1,3])
     with t1:
         if st.button("💾 Save Tuning"):
             ok = save_settings(base_edit, off_new, def_new)
@@ -554,84 +542,34 @@ if has_data:
 
     mu_home_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (home_off - away_def)
     mu_away_raw = BASE["BASE_TEAM_POINTS"] + BASE["RATING_SCALE_TO_POINTS"] * (away_off - home_def)
-    hfa_pts = 0.0 if st.session_state.get("neutral_key", False) else st.session_state.get("hfa_key", 2.5)
+    hfa_pts = 0.0 if neutral else hfa
     mu_home_raw += hfa_pts/2.0; mu_away_raw -= hfa_pts/2.0
 
-    w_mult = weather_multiplier(st.session_state.get("temp_key", 65), st.session_state.get("wind_key", 5),
-                                st.session_state.get("precip_key", "None"), st.session_state.get("indoor_key", False))
+    w_mult = weather_multiplier(temp_f, wind_mph, precip, indoor)
 
     mu_home = mu_home_raw * w_mult; mu_away = mu_away_raw * w_mult
     sd_home = volatility_sd_dyn(home_row, away_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
     sd_away = volatility_sd_dyn(away_row, home_row, BASE["MIN_SD_POINTS"], BASE["MAX_SD_POINTS"])
-    if not st.session_state.get("indoor_key", False):
+    if not indoor:
         sd_tighten = 1.0 - (1.0 - w_mult)*0.5
         sd_home *= sd_tighten; sd_away *= sd_tighten
 
-    n_sims = int(st.session_state.get("n_sims_key", 10000))
-    seed = int(st.session_state.get("seed_key", 42))
-    market_weight = float(st.session_state.get("market_weight_key", 0.35))
-    market_spread_home = float(st.session_state.get("market_spread_key", -3.0))
-    market_total = float(st.session_state.get("market_total_key", 52.5))
-    spread_odds = int(st.session_state.get("spread_odds_key", -110))
-    total_odds  = int(st.session_state.get("total_odds_key", -110))
-    spread_method = st.session_state.get("spread_method_key", "Mean")
+    home_scores, away_scores = simulate_scores(mu_home, mu_away, sd_home, sd_away, int(n_sims), int(seed))
+    margins = home_scores - away_scores; totals = home_scores + away_scores
 
-    home_scores, away_scores = simulate_scores(mu_home, mu_away, sd_home, sd_away, n_sims, seed)
-    margins = home_scores - away_scores
-    totals  = home_scores + away_scores
-
-    # Model line by selected method
-    model_spread = spread_from_margin(margins, spread_method)
+    # Model lines (betting style per team)
+    model_spread = float(np.mean(margins))   # + => home ahead
     model_total  = float(np.mean(totals))
+    model_home_line = -model_spread
+    model_away_line = +model_spread
 
+    # Blended lines
     blend_spread = (1 - market_weight) * model_spread + market_weight * market_spread_home
     blend_total  = (1 - market_weight) * model_total  + market_weight * market_total
+    blend_home_line = -blend_spread
+    blend_away_line = +blend_spread
 
-    # Betting metrics vs market lines
-    def cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, spread_odds, total_odds):
-        margin = home_scores - away_scores
-        total = home_scores + away_scores
-        k = market_spread_home
-        k_is_int = abs(k - round(k)) < 1e-9
-        if k_is_int:
-            p_home_push = float(np.mean(margin == int(round(k))))
-            p_home_cover = float(np.mean(margin > k))
-            p_home_lose = max(0.0, 1.0 - p_home_cover - p_home_push)
-        else:
-            p_home_push = 0.0; p_home_cover = float(np.mean(margin > k)); p_home_lose = 1.0 - p_home_cover
-        t = market_total
-        t_is_int = abs(t - round(t)) < 1e-9
-        if t_is_int:
-            p_over_push = float(np.mean(total == int(round(t))))
-            p_over = float(np.mean(total > t))
-            p_under = max(0.0, 1.0 - p_over - p_over_push)
-        else:
-            p_over_push = 0.0; p_over = float(np.mean(total > t)); p_under = 1.0 - p_over
-        return {
-            "p_home_cover": p_home_cover, "p_home_push": p_home_push, "p_away_cover": p_home_lose,
-            "ev_home_spread": ev_from_p(p_home_cover, spread_odds, p_home_push),
-            "ev_away_spread": ev_from_p(p_home_lose,  spread_odds, p_home_push),
-            "p_over": p_over, "p_over_push": p_over_push, "p_under": p_under,
-            "ev_over": ev_from_p(p_over,  total_odds, p_over_push),
-            "ev_under": ev_from_p(p_under, total_odds, p_over_push),
-            "home_win": float(np.mean(margin > 0.0) + 0.5*np.mean(margin == 0.0)),
-            "away_win": float(np.mean(margin < 0.0) + 0.5*np.mean(margin == 0.0)),
-        }
-
-    metrics = cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, spread_odds, total_odds)
-
-    def choose_recommendation(metrics, market_spread_home, market_total):
-        candidates = [
-            ("Home " + (f"{market_spread_home:+g}" if market_spread_home != 0 else "PK"),
-             metrics["ev_home_spread"], metrics["p_home_cover"]),
-            ("Away " + (f"{-market_spread_home:+g}" if market_spread_home != 0 else "PK"),
-             metrics["ev_away_spread"], metrics["p_away_cover"]),
-            (f"Over {market_total:g}", metrics["ev_over"], metrics["p_over"]),
-            (f"Under {market_total:g}", metrics["ev_under"], metrics["p_under"]),
-        ]
-        label, ev, p = max(candidates, key=lambda x: x[1])
-        return {"label": label, "ev": ev, "p": p, "confidence": bucket_confidence(ev, p)}
-
+    metrics = cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, int(spread_odds), int(total_odds))
     recommendation = choose_recommendation(metrics, market_spread_home, market_total)
     proj_home = float(np.mean(home_scores)); proj_away = float(np.mean(away_scores))
     winner = home if proj_home > proj_away else away
@@ -647,7 +585,7 @@ if has_data:
       <div class="summary-item"><div class="label">Projected Winner</div>
         <div class="value winner">{winner}</div></div>
       <div class="summary-item"><div class="label">Blended Spread</div>
-        <div class="value">{fmt_home_line(blend_spread, home)}</div></div>
+        <div class="value">{home}: {blend_home_line:+.2f} &nbsp;/&nbsp; {away}: {blend_away_line:+.2f}</div></div>
       <div class="summary-item"><div class="label">Blended Total</div>
         <div class="value">{blend_total:.2f}</div></div>
       <div class="summary-item"><div class="label">Recommendation</div>
@@ -664,13 +602,13 @@ if has_data:
         st.caption(f"Median: {home} {np.median(home_scores):.0f} — {away} {np.median(away_scores):.0f}")
     with c2:
         st.subheader("Model Lines")
-        st.metric("Spread", fmt_home_line(model_spread, home))
-        st.metric("Total", f"{model_total:.2f}")
-        st.caption(f"Method: {spread_method}")
+        st.metric(f"{home} spread", f"{model_home_line:+.2f}")
+        st.metric(f"{away} spread", f"{model_away_line:+.2f}")
+        st.caption("Betting-style (negative = favorite).")
     with c3:
         st.subheader("Market-Blended Lines")
-        st.metric("Spread", fmt_home_line(blend_spread, home))
-        st.metric("Total", f"{blend_total:.2f}")
+        st.metric(f"{home} spread", f"{blend_home_line:+.2f}")
+        st.metric(f"{away} spread", f"{blend_away_line:+.2f}")
         st.caption(f"Blend: {100*(1-market_weight):.0f}% model / {100*market_weight:.0f}% market")
 
     st.divider()
@@ -696,7 +634,7 @@ def _profit_units(row) -> float:
     res = (str(row.get("result") or "pending")).lower()
     if res == "win":  return stake * per_unit
     if res == "loss": return -stake
-    return 0.0  # push/pending/other
+    return 0.0
 
 def bettor_summary(df: pd.DataFrame, bettor: str):
     if df is None or df.empty or "bettor" not in df.columns:
@@ -720,7 +658,6 @@ with tabs[2]:
     st.markdown("### Bet Board")
     bet_df = load_table("bet_logs")
 
-    # Board names (from secrets or fallback)
     default_bettors: List[str] = st.secrets.get("BETTORS", [])
     if not default_bettors and "bettor" in bet_df.columns and not bet_df.empty:
         default_bettors = [b for b in bet_df["bettor"].dropna().unique().tolist()][:3]
@@ -755,7 +692,7 @@ with tabs[2]:
             if "bettor" in dfw.columns:
                 dfw = dfw[dfw["bettor"] == who]
             else:
-                dfw = dfw.iloc[0:0]  # empty
+                dfw = dfw.iloc[0:0]
 
             if "result" in dfw.columns:
                 dfw = dfw[~dfw["result"].eq("deleted")]
@@ -851,7 +788,6 @@ with tabs[2]:
 
     if submit:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-
         ms = round(model_spread, 2) if has_data else None
         mt = round(model_total, 2) if has_data else None
         bs = round(blend_spread, 2) if has_data else None
@@ -897,7 +833,7 @@ with tabs[2]:
             if has_data:
                 lines += [
                     "",
-                    f"Blend: spread {bs:+.2f}, total {bt:.2f}",
+                    f"Blend: {home}: {(-blend_spread):+.2f} / {away}: {(+blend_spread):+.2f} (total {blend_total:.2f})",
                     f"Reco: {recommendation['confidence']} — {recommendation['label']}",
                 ]
             if note_line:
@@ -909,187 +845,34 @@ with tabs[2]:
 
         st.rerun()
 
-# =============================== Saved Projections ===============================
-def _to_jsonable(x: Any) -> Any:
-    try:
-        json.dumps(x); return x
-    except Exception:
-        try:
-            return json.loads(x)
-        except Exception:
-            return str(x)
-
-def save_projection_to_supabase(row: dict) -> bool:
-    """
-    Insert into saved_projections. If 'context' doesn't exist in Supabase,
-    retry without it and show a one-time hint.
-    """
-    sb = _supabase_client()
-    if not sb:
-        return persist_row(row, "saved_projections")
-
-    try:
-        res = sb.table("saved_projections").insert(row).execute()
-        if getattr(res, "error", None):
-            raise RuntimeError(res.error)
-        return True
-    except Exception as e:
-        msg = str(e)
-        # Try again without context if the column is missing
-        if "column" in msg and "context" in msg or "missing" in msg.lower():
-            row2 = dict(row); row2.pop("context", None)
-            try:
-                res2 = sb.table("saved_projections").insert(row2).execute()
-                if getattr(res2, "error", None):
-                    raise RuntimeError(res2.error)
-                st.info("Saved without 'context'. Add it with:\n\n"
-                        "`alter table public.saved_projections add column if not exists context jsonb;`")
-                return True
-            except Exception as e2:
-                st.error(f"Save failed: {e2}")
-                return False
-        else:
-            st.error(f"Save failed: {e}")
-            return False
-
-def load_projection_into_controls(rec: dict):
-    """
-    Prepare a payload of state values from a saved projection and queue it to be
-    applied on the next run (before widgets are instantiated).
-    """
-    payload = {}
-
-    # Teams
-    if rec.get("home"):
-        payload["home_team_top"] = rec["home"]
-    if rec.get("away"):
-        payload["away_team_top"] = rec["away"]
-
-    # HFA / neutral / sim settings
-    hfa_pts = float(rec.get("hfa_points") or 0.0)
-    payload["neutral_key"] = (abs(hfa_pts) < 1e-9)
-    payload["hfa_key"] = hfa_pts
-    if rec.get("n_sims") is not None:
-        payload["n_sims_key"] = int(rec["n_sims"])
-    if rec.get("seed") is not None:
-        payload["seed_key"] = int(rec["seed"])
-
-    # Use context JSON when present
-    ctx = rec.get("context")
-    if isinstance(ctx, str):
-        try:
-            ctx = json.loads(ctx)
-        except Exception:
-            ctx = None
-
-    if isinstance(ctx, dict):
-        mkt = ctx.get("market") or {}
-        wx  = ctx.get("weather") or {}
-        sim = ctx.get("simulation") or {}
-
-        # Market
-        if "weight" in mkt:       payload["market_weight_key"] = float(mkt["weight"])
-        if "spread_home" in mkt:  payload["market_spread_key"] = float(mkt["spread_home"])
-        if "total" in mkt:        payload["market_total_key"]  = float(mkt["total"])
-        if "spread_odds" in mkt:  payload["spread_odds_key"]   = int(mkt["spread_odds"])
-        if "total_odds" in mkt:   payload["total_odds_key"]    = int(mkt["total_odds"])
-
-        # Weather
-        if "indoor" in wx:        payload["indoor_key"]        = bool(wx["indoor"])
-        if "temp_f" in wx:        payload["temp_key"]          = float(wx["temp_f"])
-        if "wind_mph" in wx:      payload["wind_key"]          = float(wx["wind_mph"])
-        if "precip" in wx:        payload["precip_key"]        = str(wx["precip"])
-        if "neutral" in wx:       payload["neutral_key"]       = bool(wx["neutral"])
-        if "hfa_points" in wx:    payload["hfa_key"]           = float(wx["hfa_points"])
-
-        # Simulation
-        if "n_sims" in sim:       payload["n_sims_key"]        = int(sim["n_sims"])
-        if "seed" in sim:         payload["seed_key"]          = int(sim["seed"])
-        if "spread_method" in sim:payload["spread_method_key"] = str(sim["spread_method"])
-    else:
-        # Best-effort reconstruction if no context saved
-        try:
-            w  = float(st.session_state.get("market_weight_key", 0.35))
-            ms = float(rec.get("model_spread"))
-            bs = float(rec.get("blended_spread"))
-            if w > 0:
-                payload["market_spread_key"] = (bs - (1.0 - w)*ms) / w
-        except Exception:
-            pass
-        try:
-            w  = float(st.session_state.get("market_weight_key", 0.35))
-            mt = float(rec.get("model_total"))
-            bt = float(rec.get("blended_total"))
-            if w > 0:
-                payload["market_total_key"] = (bt - (1.0 - w)*mt) / w
-        except Exception:
-            pass
-
-    # Queue updates for next run (so widgets pick them up as initial values)
-    st.session_state["_queued_state"] = payload
-    st.rerun()
-
-
+# =============================== Saved Projections (no loading) ===============================
 with tabs[3]:
     st.markdown("### Save / Manage Projections")
 
     if has_data:
         if st.button("💾 Save Current Projection Summary"):
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            indoor = bool(st.session_state.get("indoor_key", False))
-            temp_f = float(st.session_state.get("temp_key", 65))
-            wind_mph = float(st.session_state.get("wind_key", 5))
-            precip = str(st.session_state.get("precip_key", "None"))
-            neutral = bool(st.session_state.get("neutral_key", False))
-            hfa_pts = float(st.session_state.get("hfa_key", 2.5))
-            n_sims = int(st.session_state.get("n_sims_key", 10000))
-            seed = int(st.session_state.get("seed_key", 42))
-            market_weight = float(st.session_state.get("market_weight_key", 0.35))
-            market_spread_home = float(st.session_state.get("market_spread_key", -3.0))
-            market_total = float(st.session_state.get("market_total_key", 52.5))
-            spread_odds = int(st.session_state.get("spread_odds_key", -110))
-            total_odds  = int(st.session_state.get("total_odds_key", -110))
-            w_mult = weather_multiplier(temp_f, wind_mph, precip, indoor)
-
-            context = {
-                "market": {
-                    "spread_home": market_spread_home,
-                    "total": market_total,
-                    "weight": market_weight,
-                    "spread_odds": spread_odds,
-                    "total_odds": total_odds,
-                },
-                "weather": {
-                    "indoor": indoor,
-                    "temp_f": temp_f,
-                    "wind_mph": wind_mph,
-                    "precip": precip,
-                    "neutral": neutral,
-                    "hfa_points": hfa_pts,
-                    "weather_mult": round(w_mult, 3),
-                },
-                "simulation": {
-                    "n_sims": n_sims,
-                    "seed": seed,
-                    "spread_method": st.session_state.get("spread_method_key", "Mean"),
-                }
-            }
-
             row = {
                 "timestamp": ts, "home": home, "away": away, "room": _room(),
                 "proj_home": round(proj_home, 1), "proj_away": round(proj_away, 1),
                 "model_spread": round(model_spread, 2), "model_total": round(model_total, 2),
                 "blended_spread": round(blend_spread, 2), "blended_total": round(blend_total, 2),
                 "winner": winner, "recommendation": f"{recommendation['confidence']} — {recommendation['label']}",
-                "ev_best": round(recommendation["ev"], 3), "weather_mult": round(w_mult, 3),
-                "hfa_points": hfa_pts, "n_sims": n_sims, "seed": seed,
-                "context": _to_jsonable(context),
+                "ev_best": round(recommendation["ev"], 3), "weather_mult": round(weather_multiplier(temp_f, wind_mph, precip, indoor), 3),
+                "hfa_points": float(0.0 if neutral else hfa), "n_sims": int(n_sims), "seed": int(seed),
+                "market_spread_home": float(market_spread_home),
+                "market_total": float(market_total),
+                "market_weight": float(market_weight),
+                "spread_odds": int(spread_odds),
+                "total_odds": int(total_odds),
+                "temp_f": float(temp_f),
+                "wind_mph": float(wind_mph),
+                "precip": precip,
+                "indoor": bool(indoor),
+                "neutral": bool(neutral),
             }
-
-            if save_projection_to_supabase(row):
+            if persist_row(row, "saved_projections"):
                 st.success("Projection saved.")
-            else:
-                st.error("Could not save projection.")
             st.rerun()
     else:
         st.info("Upload a CSV to save new projections. You can still view and manage previously saved items below.")
@@ -1111,45 +894,31 @@ with tabs[3]:
         pdf = pdf.sort_values("ts_ord", ascending=not sort_newest, na_position="last").drop(columns=["ts_ord"])
         pdf = pdf.head(max_items)
 
+        # Grid cards (no Load button)
         st.markdown('<div class="proj-grid">', unsafe_allow_html=True)
         for _, r in pdf.iterrows():
             rid = int(r.get("id", 0))
-            ctx_preview = ""
-            ctx = r.get("context")
-            if isinstance(ctx, str):
-                try:
-                    ctx = json.loads(ctx)
-                except Exception:
-                    ctx = None
-            if isinstance(ctx, dict):
-                try:
-                    mw = ctx.get("market", {}).get("weight", None)
-                    so = ctx.get("market", {}).get("spread_odds", None)
-                    to = ctx.get("market", {}).get("total_odds", None)
-                    ctx_preview = f"<div style='opacity:.7;font-size:.8rem;'>mw={mw}, vig(S/T)={so}/{to}</div>"
-                except Exception:
-                    ctx_preview = ""
+            home_name = r.get('home','?'); away_name = r.get('away','?')
+            blended_spread_r = float(r.get('blended_spread', 0) or 0.0)
+            blended_total_r  = float(r.get('blended_total', 0) or 0.0)
 
             card = f"""
             <div class="proj-card">
-              <div style="font-weight:700;font-size:1.05rem;">{r.get('home','?')} vs {r.get('away','?')}</div>
+              <div style="font-weight:700;font-size:1.05rem;">{home_name} vs {away_name}</div>
               <div style="opacity:.7;font-size:.85rem;">{r.get('timestamp','')}</div>
               <div style="margin-top:.35rem;">
-                <div><b>Projected</b> — {r.get('home','?')}: {r.get('proj_home','?')}, {r.get('away','?')}: {r.get('proj_away','?')}</div>
-                <div><b>Model</b> — {fmt_home_line(float(r.get('model_spread',0)), r.get('home','?'))}, Total {float(r.get('model_total',0)):.2f}</div>
-                <div><b>Blended</b> — {fmt_home_line(float(r.get('blended_spread',0)), r.get('home','?'))}, Total {float(r.get('blended_total',0)):.2f}</div>
+                <div><b>Projected</b> — {home_name}: {r.get('proj_home','?')}, {away_name}: {r.get('proj_away','?')}</div>
+                <div><b>Model</b> — {home_name}: {-(float(r.get('model_spread',0) or 0.0)):+.2f} / {away_name}: {(float(r.get('model_spread',0) or 0.0)):+.2f} (total {float(r.get('model_total',0) or 0.0):.2f})</div>
+                <div><b>Blended</b> — {home_name}: {(-blended_spread_r):+.2f} / {away_name}: {(+blended_spread_r):+.2f} (total {blended_total_r:.2f})</div>
                 <div><b>Winner</b> — {r.get('winner','?')}</div>
                 <div><b>Rec</b> — {r.get('recommendation','')}</div>
-                {ctx_preview}
               </div>
             </div>
             """
             st.markdown(card, unsafe_allow_html=True)
-            colsx = st.columns([0.2, 0.2, 2.6])
-            with colsx[0]:
-                if st.button("Load", key=f"load_proj_{rid}"):
-                    load_projection_into_controls(r)
-            with colsx[1]:
+
+            cDel, _ = st.columns([0.2, 2.8])
+            with cDel:
                 if st.button("Delete", key=f"del_proj_{rid}"):
                     if rid and delete_row("saved_projections", rid):
                         st.success("Deleted."); st.rerun()
@@ -1169,9 +938,7 @@ with tabs[3]:
                     st.success("Deleted filtered." if ok_all else "Deleted with some errors."); st.rerun()
                 else:
                     st.warning("Check confirm to proceed.")
-        st.markdown("---")
 
-        # Raw table + download
         st.dataframe(pdf, width="stretch")
         st.download_button(
             "⬇️ Download filtered (CSV)",
