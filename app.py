@@ -1,8 +1,9 @@
 # app.py — 🥜 The Goober Model (CFB)
+# - Bet Board available without CSV
 # - Supabase persistence for bets + saved projections
-# - Discord notify via Supabase Edge Function "notify-bet"
-# - Weekly roundup is an Edge Function on a schedule (not in this file)
-# - Polished UI: score cards, prediction details, grounding snapshot, matchup bars, bet board
+# - Discord notify via Edge Function "discord-bot"
+# - No tab jump when saving a projection
+# - Uses stored team names on bets so display works even without CSV
 
 import math
 from datetime import datetime
@@ -12,43 +13,35 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional chart lib for "Matchup Snapshot"
 try:
     import altair as alt
 except Exception:
     alt = None
 
-# ---------- Styling ----------
+# ---------- Page / Styles ----------
 st.set_page_config(page_title="🥜 The Goober Model", layout="wide")
 st.markdown(
     """
 <style>
 .page-sep { height: 2px; background: linear-gradient(90deg, #0ea5e933, #22c55e55, #f59e0b33);
             border-radius: 999px; margin: 18px 0 14px 0; }
-/* score cards */
-.score-card { padding:16px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);
-              margin-bottom:14px; }
+.score-card { padding:16px; border-radius:12px; border:1px solid rgba(255,255,255,0.08); margin-bottom:14px; }
 .score-green { background: rgba(16,185,129,0.16); }
 .score-yellow{ background: rgba(234,179,8,0.16); }
 .section-caption { font-size:0.85rem; opacity:0.75; }
 .small { font-size:.9rem; opacity:.9; }
-/* chips under score cards */
 .value-chip { padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);
               background: rgba(255,255,255,0.03); margin-bottom:14px; }
 .value-chip .label { font-size:0.85rem; opacity:0.75; margin-bottom:4px; }
 .value-chip .value { font-size:1.25rem; font-weight:700; }
-/* big recommendation pill */
 .rec-card { background: rgba(16,185,129,0.16); border:1px solid rgba(16,185,129,0.35);
             padding:16px 18px; border-radius:12px; font-weight:800; font-size:1.1rem; }
-/* stat tiles for Prediction Details */
 .stat-grid { display:grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap:12px; }
 .stat-card { padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);
              background: rgba(255,255,255,0.03); }
 .stat-card .title { font-size:0.85rem; opacity:0.8; margin-bottom:4px; }
 .stat-card .num { font-weight:700; font-size:1.15rem; }
-/* helpers */
 .muted { opacity:.85; }
-/* bet status badge */
 .status-badge { display:inline-block; padding:2px 8px; border-radius:999px;
                 font-size:0.75rem; font-weight:700; color:#fff; margin-left:8px; }
 .status-pending { background:#64748b; }
@@ -60,7 +53,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- Supabase (optional) ----------
+# ---------- Supabase ----------
 from supabase import create_client, Client
 
 @st.cache_resource
@@ -75,7 +68,7 @@ def get_sb() -> Client | None:
 sb: Client | None = get_sb()
 USE_DB = sb is not None
 
-# ---------- Utilities ----------
+# ---------- Utils ----------
 def normal_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -107,14 +100,12 @@ def clamp_nonneg(x: float) -> float:
     return max(0.0, float(x))
 
 def _round_line(val: float, eps: float = 0.05) -> float:
-    """Round to 0.1; squash tiny magnitudes to 0 (avoid -0.0; clean PK)."""
     if val is None or np.isnan(val):
         return 0.0
     r = round(float(val), 1)
     return 0.0 if abs(r) < eps else r
 
 def format_home_away_spreads(home_team: str, away_team: str, home_line: float) -> tuple[str, str]:
-    """home_line: sportsbook home line (home favored NEGATIVE)."""
     L = _round_line(home_line)
     n = abs(L)
     if L < 0:
@@ -125,11 +116,9 @@ def format_home_away_spreads(home_team: str, away_team: str, home_line: float) -
         return f"{home_team} PK", f"{away_team} PK"
 
 def model_spread_to_home_line(spread_model: float) -> float:
-    """Model margin is HOME − AWAY. Sportsbook home line is negative if home favored."""
     return -spread_model
 
 def home_cover_probability(spread_model: float, home_market_line: float, sigma_margin: float) -> float:
-    """Margin M ~ N(spread_model, σ). Home covers line L iff M > -L."""
     z = ((-home_market_line) - spread_model) / max(1e-9, sigma_margin)
     return 1.0 - normal_cdf(z)
 
@@ -149,10 +138,6 @@ def get_team_row(df: pd.DataFrame, team: str) -> pd.Series:
     return row.iloc[0] if not row.empty else pd.Series(dtype=object)
 
 def centered_from_rank(rank: float, n_teams: int) -> float:
-    """
-    Convert a rank (1 = best/hardest) into centered score in [-0.5, +0.5].
-    +0.5 means rank #1, -0.5 means rank ~N (easiest/worst).
-    """
     if np.isnan(rank) or rank <= 0 or n_teams <= 0:
         return 0.0
     return ((n_teams + 1 - rank) / n_teams) - 0.5
@@ -162,19 +147,17 @@ def status_badge_html(status: str) -> str:
     cls = {"pending":"status-pending","win":"status-win","loss":"status-loss","push":"status-push"}.get(s,"status-pending")
     return f"<span class='status-badge {cls}'>{s.capitalize()}</span>"
 
-# ---------- Supabase helpers (db) + fallback ----------
+# ---------- DB helpers ----------
 def db_list_bets():
     if USE_DB:
         res = sb.table("bets").select("*").order("created_at", desc=True).execute()
         return res.data or []
-    # fallback (local memory)
     return st.session_state.get("bets", [])
 
 def db_add_bet(rec: dict):
     if USE_DB:
         ins = sb.table("bets").insert(rec).select("*").single().execute()
         return ins.data
-    # fallback
     rec = rec.copy()
     rec["id"] = rec.get("id") or str(uuid.uuid4())
     st.session_state.setdefault("bets", []).insert(0, rec)
@@ -184,9 +167,7 @@ def db_update_bet_status(bet_id: str, status: str):
     if USE_DB:
         sb.table("bets").update({"status": status}).eq("id", bet_id).execute()
         return
-    # fallback
-    arr = st.session_state.get("bets", [])
-    for x in arr:
+    for x in st.session_state.get("bets", []):
         if x.get("id") == bet_id:
             x["status"] = status
 
@@ -220,209 +201,432 @@ def send_discord_bet(bet: dict):
     if not USE_DB:
         return
     try:
-        # Send either { op: "notify-bet", bet: {...} } or just the bet object.
         sb.functions.invoke("discord-bot", body={"op": "notify-bet", "bet": bet})
     except Exception as e:
         st.warning(f"Discord notify failed: {e}")
 
-
-# ---------- Header & CSV ----------
+# ---------- Header & Upload ----------
 st.title("🥜 The Goober Model")
 st.caption("College Football Predictor — FPI & efficiencies with weather, market, and optional SOS / SOR / GC grounding. (Supabase-enabled)")
 
 st.sidebar.header("📄 Upload data")
 csv_file = st.sidebar.file_uploader("Combined CSV (FPI + Efficiencies)", type=["csv"], accept_multiple_files=False)
 
-if not csv_file:
-    st.info("⬅️ Upload your combined CSV to begin.", icon="🔎")
-    st.stop()
+DATA_READY = False
+df = None
+teams = []
+n_teams = 0
+home_team = ""
+away_team = ""
 
-try:
-    df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
-except Exception as e:
-    st.error(f"Could not read CSV: {e}")
-    st.stop()
+if csv_file:
+    try:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+        if "Team" in df.columns:
+            teams = sorted(df["Team"].unique().tolist())
+            n_teams = max(1, len(teams))
+            DATA_READY = True
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
 
-required = {"Team", "FPI", "OFF_EFF", "DEF_EFF", "SP_EFF"}
-missing = sorted(list(required - set(df.columns)))
-if missing:
-    st.warning(f"Missing columns: {missing}. The app will still work, but predictions may be weaker.", icon="⚠️")
-
-teams = sorted(df["Team"].unique().tolist())
-n_teams = max(1, len(teams))
-
-cA, cB = st.columns(2)
-with cA:
-    home_team = st.selectbox("Home Team", teams, index=0 if teams else None,
-                             help="Team playing at home (or designated as home).")
-with cB:
-    away_team = st.selectbox("Away Team", teams, index=1 if len(teams) > 1 else 0,
-                             help="Visiting team.")
-if home_team == away_team:
-    st.warning("Please select two different teams.", icon="⚠️")
-    st.stop()
-
-home_row = get_team_row(df, home_team)
-away_row = get_team_row(df, away_team)
-(off_mean, def_mean, sp_mean,
- ovrl_mean, fpi_mean, fpi_min, fpi_max) = league_means(df)
-
-# ---------- Tabs ----------
+# ---------- Tabs (always render) ----------
 tab_adj, tab_bets, tab_saved, tab_snap, tab_guide = st.tabs(
     ["⚙️ Adjustments", "🧾 Bet Board", "💾 Saved Projections", "📌 Matchup Snapshot", "ℹ️ Model Guide"]
 )
 
+# ---------- Adjustments tab ----------
 with tab_adj:
-    st.subheader("Model & Market Adjustments")
-    g1, g2, g3, g4 = st.columns(4)
-    with g1:
-        hfa_pts = st.slider("Home Field Advantage (pts)", 0.0, 5.0, 2.5, 0.1,
-            help="Adds to the HOME team’s expected margin. Typical CFB ~2–3 points.")
-        base_total = st.slider("Base Total (league avg)", 40.0, 70.0, 54.0, 0.5,
-            help="Starting point for total points before efficiency & weather nudges.")
-    with g2:
-        alpha_total = st.slider("α (OFF vs DEF)", 0.0, 1.0, 0.30, 0.01,
-            help="How strongly good offense / weak defense pushes totals up (and vice versa).")
-        beta_st = st.slider("β (Special Teams)", 0.0, 0.3, 0.05, 0.01,
-            help="Small nudge from special teams efficiency; keep modest.")
-    with g3:
-        sigma_margin = st.slider("σ (spread) — pts", 6.0, 21.0, 13.0, 0.5,
-            help="How noisy game margins are. Larger σ ⇒ less certain spreads & cover %.")
-        sigma_total = st.slider("σ (total) — pts", 6.0, 21.0, 10.0, 0.5,
-            help="How noisy totals are. Larger σ ⇒ P(Over/Under) closer to 50%.")
-    with g4:
-        neutral_site = st.checkbox("Neutral site", value=False,
-            help="Remove HFA from the spread if played at a neutral site.")
-        indoor_roof = st.checkbox("Indoors / Roof closed", value=False,
-            help="Ignore weather if conditions are controlled (domes, roof closed).")
+    if not DATA_READY:
+        st.info("Upload your combined CSV in the sidebar to use the predictor.", icon="🔎")
+    else:
+        # --- team pickers
+        cA, cB = st.columns(2)
+        with cA:
+            home_team = st.selectbox("Home Team", teams, index=0 if teams else None)
+        with cB:
+            away_team = st.selectbox("Away Team", teams, index=1 if len(teams) > 1 else 0)
+        if home_team == away_team:
+            st.warning("Please select two different teams.", icon="⚠️")
+            st.stop()
 
-    st.markdown("#### Weather (ignored if indoors/roof closed)")
-    w1, w2, w3 = st.columns(3)
-    with w1:
-        temp_f = st.slider("Temperature (°F)", 10, 100, 70, 1,
-            help="Cold (<40°F) or hot (>85°F) slightly reduces expected scoring.")
-    with w2:
-        wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1,
-            help="Above ~10 mph, wind trims passing/kicking efficiency and lowers totals.")
-    with w3:
-        precip = st.select_slider("Precipitation", options=["None","Light","Moderate","Heavy"], value="None",
-            help="Rain/snow reduces totals; heavier precip lowers more.")
+        home_row = get_team_row(df, home_team)
+        away_row = get_team_row(df, away_team)
+        (off_mean, def_mean, sp_mean, ovrl_mean, fpi_mean, fpi_min, fpi_max) = league_means(df)
 
-    st.divider()
-    st.subheader("Market Lines (for comparison / blending)")
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        market_spread_home = st.number_input("Market Spread (home line)", value=-3.5, step=0.5,
-            help="Sportsbook home line (negative means home favorite).")
-    with m2:
-        market_total = st.number_input("Market Total", value=54.5, step=0.5,
-            help="Sportsbook total points line.")
-    with m3:
-        spread_price = st.number_input("Spread Price (American)", value=-110, step=5,
-            help="Price for the spread (e.g., -110). Used for EV calc.")
-    with m4:
-        total_price = st.number_input("Total Price (American)", value=-110, step=5,
-            help="Price for Over/Under (e.g., -110). Used for EV calc.")
+        # --- adjustments UI (same as before)
+        st.subheader("Model & Market Adjustments")
+        g1, g2, g3, g4 = st.columns(4)
+        with g1:
+            hfa_pts = st.slider("Home Field Advantage (pts)", 0.0, 5.0, 2.5, 0.1,
+                help="Adds to the HOME team’s expected margin. Typical CFB ~2–3 points.")
+            base_total = st.slider("Base Total (league avg)", 40.0, 70.0, 54.0, 0.5,
+                help="Starting point for total points before efficiency & weather nudges.")
+        with g2:
+            alpha_total = st.slider("α (OFF vs DEF)", 0.0, 1.0, 0.30, 0.01,
+                help="How strongly good offense / weak defense pushes totals up (and vice versa).")
+            beta_st = st.slider("β (Special Teams)", 0.0, 0.3, 0.05, 0.01,
+                help="Small nudge from special teams efficiency; keep modest.")
+        with g3:
+            sigma_margin = st.slider("σ (spread) — pts", 6.0, 21.0, 13.0, 0.5,
+                help="How noisy game margins are. Larger σ ⇒ less certain spreads & cover %.")
+            sigma_total = st.slider("σ (total) — pts", 6.0, 21.0, 10.0, 0.5,
+                help="How noisy totals are. Larger σ ⇒ P(Over/Under) closer to 50%.")
+        with g4:
+            neutral_site = st.checkbox("Neutral site", value=False,
+                help="Remove HFA from the spread if played at a neutral site.")
+            indoor_roof = st.checkbox("Indoors / Roof closed", value=False,
+                help="Ignore weather if conditions are controlled (domes, roof closed).")
 
-    st.markdown("#### Blending")
-    blend_weight = st.slider("Market Blend Weight (w)", 0.0, 1.0, 0.35, 0.05,
-        help="0 = pure model; 1 = pure market. Blends lines/total for a sanity-checked number.")
+        st.markdown("#### Weather (ignored if indoors/roof closed)")
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            temp_f = st.slider("Temperature (°F)", 10, 100, 70, 1,
+                help="Cold (<40°F) or hot (>85°F) slightly reduces expected scoring.")
+        with w2:
+            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1,
+                help="Above ~10 mph, wind trims passing/kicking efficiency and lowers totals.")
+        with w3:
+            precip = st.select_slider("Precipitation", options=["None","Light","Moderate","Heavy"], value="None",
+                help="Rain/snow reduces totals; heavier precip lowers more.")
 
-    # ----- Grounding (optional) + side snapshot -----
-    st.divider()
-    st.subheader("Grounding (optional)")
-    gleft, gright = st.columns([2, 1])
+        st.divider()
+        st.subheader("Market Lines (for comparison / blending)")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            market_spread_home = st.number_input("Market Spread (home line)", value=-3.5, step=0.5,
+                help="Sportsbook home line (negative means home favorite).")
+        with m2:
+            market_total = st.number_input("Market Total", value=54.5, step=0.5,
+                help="Sportsbook total points line.")
+        with m3:
+            spread_price = st.number_input("Spread Price (American)", value=-110, step=5,
+                help="Price for the spread (e.g., -110). Used for EV calc.")
+        with m4:
+            total_price = st.number_input("Total Price (American)", value=-110, step=5,
+                help="Price for Over/Under (e.g., -110). Used for EV calc.")
 
-    with gleft:
+        st.markdown("#### Blending")
+        blend_weight = st.slider("Market Blend Weight (w)", 0.0, 1.0, 0.35, 0.05,
+            help="0 = pure model; 1 = pure market. Blends lines/total for a sanity-checked number.")
+
+        # ----- Grounding + snapshot
+        st.divider()
+        st.subheader("Grounding (optional)")
+        gleft, gright = st.columns([2, 1])
+
+        with gleft:
+            has_SOS = "SOS" in df.columns
+            has_SOR = "SOR" in df.columns
+            has_GC  = "GC"  in df.columns
+
+            if not has_SOS:
+                st.info("`SOS` column not found — SOS grounding disabled.", icon="ℹ️")
+                adj_sos = False; sos_weight = 0.0; sos_sigma_pct = 0
+            else:
+                adj_sos = st.checkbox(
+                    "Adjust for schedule strength (SOS rank 1=hardest)",
+                    value=False,
+                    help="Nudges the model margin for harder/easier schedules and can adjust spread σ."
+                )
+                sos_weight = st.slider("SOS weight (points)", 0.0, 2.0, 0.6, 0.1, disabled=not adj_sos)
+                sos_sigma_pct = st.slider("SOS → σ multiplier (±%)", 0, 40, 0, 5, disabled=not adj_sos)
+
+            if not (has_SOR and has_GC):
+                st.info("`SOR` and/or `GC` columns not found — resume grounding disabled.", icon="ℹ️")
+                adj_resume = False; sor_w = 0.0; gc_w = 0.0; resume_cap = 0.0; resume_sigma_pct = 0
+            else:
+                adj_resume = st.checkbox(
+                    "Adjust for resume (SOR & GC ranks 1=best)",
+                    value=False,
+                    help="Tiny, capped margin nudge for better/worse results/control; optional σ scaling."
+                )
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    sor_w = st.slider("SOR weight (pts)", 0.0, 1.0, 0.4, 0.1, disabled=not adj_resume)
+                with c2:
+                    gc_w  = st.slider("GC weight (pts)", 0.0, 1.0, 0.3, 0.1, disabled=not adj_resume)
+                with c3:
+                    resume_cap = st.slider("Resume nudge cap (±pts)", 0.0, 1.5, 1.0, 0.1, disabled=not adj_resume)
+                with c4:
+                    resume_sigma_pct = st.slider("Resume → σ multiplier (±%)", 0, 30, 0, 5, disabled=not adj_resume)
+
+        with gright:
+            st.markdown("**Current matchup — resume snapshot**")
+            def _rank_center_pair(row, colname):
+                if colname not in df.columns:
+                    return "—"
+                r = get_numeric(row, colname)
+                if np.isnan(r) or r <= 0:
+                    return "—"
+                c = centered_from_rank(r, n_teams)
+                return f"{int(r)} • {c:+.2f}"
+
+            def _value_delta_pair(row, colname, mean, fmt="{:.2f}"):
+                if colname not in df.columns:
+                    return "—"
+                v = get_numeric(row, colname)
+                if np.isnan(v):
+                    return "—"
+                d = v - mean
+                return f"{fmt.format(v)} • {d:+.2f}"
+
+            data_rows = []
+            data_rows.append({"Metric": "SOS (rank)", home_team: _rank_center_pair(home_row, "SOS"),
+                              away_team: _rank_center_pair(away_row, "SOS")})
+            data_rows.append({"Metric": "SOR (rank)", home_team: _rank_center_pair(home_row, "SOR"),
+                              away_team: _rank_center_pair(away_row, "SOR")})
+            data_rows.append({"Metric": "GC (rank)",  home_team: _rank_center_pair(home_row, "GC"),
+                              away_team: _rank_center_pair(away_row, "GC")})
+            data_rows.append({"Metric": "FPI",       home_team: _value_delta_pair(home_row, "FPI", fpi_mean),
+                              away_team: _value_delta_pair(away_row, "FPI", fpi_mean)})
+            data_rows.append({"Metric": "OVRL_EFF",  home_team: _value_delta_pair(home_row, "OVRL_EFF", ovrl_mean),
+                              away_team: _value_delta_pair(away_row, "OVRL_EFF", ovrl_mean)})
+            data_rows.append({"Metric": "OFF_EFF",   home_team: _value_delta_pair(home_row, "OFF_EFF", off_mean),
+                              away_team: _value_delta_pair(away_row, "OFF_EFF", off_mean)})
+            data_rows.append({"Metric": "DEF_EFF",   home_team: _value_delta_pair(home_row, "DEF_EFF", def_mean),
+                              away_team: _value_delta_pair(away_row, "DEF_EFF", def_mean)})
+            snap_df = pd.DataFrame(data_rows).set_index("Metric")
+            st.table(snap_df)
+            st.caption("Ranks show **rank • centered** in [-0.50,+0.50] (higher = harder/better). Values show **value • Δ** vs league mean.")
+
+        # ---------- separator before results ----------
+        st.markdown('<div class="page-sep"></div>', unsafe_allow_html=True)
+
+        # ---------- Core model ----------
+        FPI_h = get_numeric(home_row, "FPI");  FPI_a = get_numeric(away_row, "FPI")
+        OFF_h = get_numeric(home_row, "OFF_EFF"); OFF_a = get_numeric(away_row, "OFF_EFF")
+        DEF_h = get_numeric(home_row, "DEF_EFF"); DEF_a = get_numeric(away_row, "DEF_EFF")
+        SP_h  = get_numeric(home_row, "SP_EFF");  SP_a  = get_numeric(away_row, "SP_EFF")
+
+        spread_neutral = (FPI_h - FPI_a) if (not np.isnan(FPI_h) and not np.isnan(FPI_a)) else 0.0
+        spread_model = spread_neutral if neutral_site else spread_neutral + hfa_pts
+
         has_SOS = "SOS" in df.columns
+        hard_h = hard_a = 0.0
+        if 'adj_sos' in locals() and adj_sos and has_SOS:
+            sos_h_rank = get_numeric(home_row, "SOS"); sos_a_rank = get_numeric(away_row, "SOS")
+            hard_h = centered_from_rank(sos_h_rank, n_teams)
+            hard_a = centered_from_rank(sos_a_rank, n_teams)
+            spread_model += sos_weight * (hard_h - hard_a)
+
         has_SOR = "SOR" in df.columns
         has_GC  = "GC"  in df.columns
+        sor_h = sor_a = gc_h = gc_a = 0.0
+        if 'adj_resume' in locals() and adj_resume and has_SOR and has_GC:
+            sor_h_rank = get_numeric(home_row, "SOR"); sor_a_rank = get_numeric(away_row, "SOR")
+            gc_h_rank  = get_numeric(home_row, "GC");  gc_a_rank  = get_numeric(away_row, "GC")
+            sor_h = centered_from_rank(sor_h_rank, n_teams); sor_a = centered_from_rank(sor_a_rank, n_teams)
+            gc_h  = centered_from_rank(gc_h_rank, n_teams);  gc_a  = centered_from_rank(gc_a_rank, n_teams)
+            resume_nudge = sor_w * (sor_h - sor_a) + gc_w * (gc_h - gc_a)
+            resume_nudge = float(np.clip(resume_nudge, -resume_cap, resume_cap))
+            spread_model += resume_nudge
 
-        # SOS
-        if not has_SOS:
-            st.info("`SOS` column not found — SOS grounding disabled.", icon="ℹ️")
-            adj_sos = False; sos_weight = 0.0; sos_sigma_pct = 0
+        off_term = center(OFF_h, off_mean) + center(OFF_a, off_mean)
+        def_term = center(DEF_h, def_mean) + center(DEF_a, def_mean)
+        sp_term  = center(SP_h,  sp_mean)  + center(SP_a,  sp_mean)
+        eff_component = alpha_total * (off_term - def_term) / 2.0
+        st_component  = beta_st * (sp_term) / 4.0
+
+        weather_adj = 0.0
+        if not indoor_roof:
+            if wind_mph > 10: weather_adj -= max(0, (wind_mph - 10)) * 0.15
+            if temp_f < 40:   weather_adj -= (40 - temp_f) * 0.05
+            if temp_f > 85:   weather_adj -= (temp_f - 85) * 0.03
+            precip_map = {"None":0.0, "Light":-0.5, "Moderate":-1.5, "Heavy":-3.0}
+            weather_adj += precip_map.get(precip, 0.0)
+
+        total_model = float(np.clip(base_total + eff_component + st_component + weather_adj, 20.0, 90.0))
+
+        home_pts_model = clamp_nonneg((total_model + spread_model) / 2.0)
+        away_pts_model = clamp_nonneg(total_model - home_pts_model)
+        home_pts_model_r = int(round(home_pts_model)); away_pts_model_r = int(round(away_pts_model))
+
+        home_line_model = _round_line(model_spread_to_home_line(spread_model))
+        blend_weight_val = st.session_state.get("blend_weight_val", 0.35)  # not used, just placeholder
+        blend_weight_val = blend_weight
+        blend_home_line = _round_line(blend_weight_val * market_spread_home + (1.0 - blend_weight_val) * home_line_model)
+        total_blended   = blend_weight_val * market_total + (1.0 - blend_weight_val) * total_model
+
+        S_b = -blend_home_line
+        home_pts_blend = clamp_nonneg((total_blended + S_b) / 2.0)
+        away_pts_blend = clamp_nonneg(total_blended - home_pts_blend)
+        home_pts_blend_r = int(round(home_pts_blend)); away_pts_blend_r = int(round(away_pts_blend))
+
+        sigma_scale = 1.0
+        if 'adj_sos' in locals() and adj_sos and has_SOS and sos_sigma_pct:
+            sigma_scale *= 1.0 + (sos_sigma_pct/100.0) * (-(hard_h + hard_a))
+        if 'adj_resume' in locals() and adj_resume and has_SOR and has_GC and resume_sigma_pct:
+            avg_resume = (sor_h + sor_a + gc_h + gc_a) / 4.0
+            sigma_scale *= 1.0 + (resume_sigma_pct/100.0) * (-(avg_resume))
+        sigma_margin_eff = float(np.clip(sigma_margin * sigma_scale, 3.0, 40.0))
+
+        p_home_win_model   = normal_cdf(spread_model / max(1e-9, sigma_margin_eff))
+        p_home_cover_model = home_cover_probability(spread_model, market_spread_home, sigma_margin_eff)
+        p_over_model       = 1.0 - normal_cdf((market_total - total_model) / max(1e-9, sigma_total))
+        ev_spread_model    = ev_per_unit(p_home_cover_model, spread_price)
+        ev_total_over      = ev_per_unit(p_over_model, total_price)
+        ev_total_under     = ev_per_unit(1.0 - p_over_model, total_price)
+
+        home_spread_str, away_spread_str = format_home_away_spreads(home_team, away_team, market_spread_home)
+        spread_pick = home_spread_str if ev_spread_model >= 0 else away_spread_str
+        tot_pick = f"Over {market_total:.1f}" if ev_total_over >= ev_total_under else f"Under {market_total:.1f}"
+        recommendation = f"{spread_pick} | {tot_pick}"
+
+        model_home_spread_str, _ = format_home_away_spreads(home_team, away_team, home_line_model)
+        blended_home_spread_str, _ = format_home_away_spreads(home_team, away_team, blend_home_line)
+        st.session_state.latest_projection = {
+            "home_team": home_team, "away_team": away_team,
+            "home_pts": float(home_pts_model), "away_pts": float(away_pts_model),
+            "total_model": float(total_model), "total_blended": float(total_blended),
+            "model_home_spread_str": model_home_spread_str,
+            "blended_home_spread_str": blended_home_spread_str,
+            "recommendation": recommendation,
+        }
+
+        st.markdown("### 🧾 Score Cards")
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.markdown(f"""
+<div class="score-card score-green">
+  <div class="section-caption">Model Score</div>
+  <div style="font-weight:700; font-size:1.05rem;">
+    {home_team} {home_pts_model:.1f} — {away_team} {away_pts_model:.1f}
+  </div>
+  <div class="small">Rounded (median): {home_team} <b>{home_pts_model_r}</b> — {away_team} <b>{away_pts_model_r}</b></div>
+  <div class="section-caption">Derived from model margin & total.</div>
+</div>
+""", unsafe_allow_html=True)
+        with sc2:
+            st.markdown(f"""
+<div class="score-card score-yellow">
+  <div class="section-caption">Blended Score</div>
+  <div style="font-weight:700; font-size:1.05rem;">
+    {home_team} {home_pts_blend:.1f} — {away_team} {away_pts_blend:.1f}
+  </div>
+  <div class="small">Rounded (median): {home_team} <b>{home_pts_blend_r}</b> — {away_team} <b>{away_pts_blend_r}</b></div>
+  <div class="section-caption">Blend of model and market lines via weight w.</div>
+</div>
+""", unsafe_allow_html=True)
+
+        mc1, mc2, mc3 = st.columns(3)
+        with mc1:
+            st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Model Home Line</div>
+  <div class="value">{format_home_away_spreads(home_team, away_team, home_line_model)[0]}</div>
+</div>""", unsafe_allow_html=True)
+        with mc2:
+            st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Blended Home Line</div>
+  <div class="value">{format_home_away_spreads(home_team, away_team, blend_home_line)[0]}</div>
+</div>""", unsafe_allow_html=True)
+        with mc3:
+            st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Market Home Line</div>
+  <div class="value">{format_home_away_spreads(home_team, away_team, market_spread_home)[0]}</div>
+</div>""", unsafe_allow_html=True)
+
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Model Total</div>
+  <div class="value">{total_model:.1f}</div>
+</div>""", unsafe_allow_html=True)
+        with tc2:
+            st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Blended Total</div>
+  <div class="value">{total_blended:.1f}</div>
+</div>""", unsafe_allow_html=True)
+        with tc3:
+            st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Market Total</div>
+  <div class="value">{market_total:.1f}</div>
+</div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("## 📊 Prediction Details (always shown)")
+        st.write(f"**Matchup:** {away_team} @ {home_team}{' (Neutral)' if neutral_site else ''}")
+
+        home_line_model_lbl, _ = format_home_away_spreads(home_team, away_team, home_line_model)
+        home_line_market_lbl, _ = format_home_away_spreads(home_team, away_team, market_spread_home)
+
+        if abs(spread_model) < 0.05:
+            favored_str = "Pick'em"
         else:
-            adj_sos = st.checkbox(
-                "Adjust for schedule strength (SOS rank 1=hardest)",
-                value=False,
-                help="Nudges the model margin for harder/easier schedules and can adjust spread σ."
+            favored_team = home_team if spread_model > 0 else away_team
+            favored_str = f"{favored_team} by {abs(spread_model):.1f}"
+
+        cL, cR = st.columns(2)
+        with cL:
+            st.subheader("Spread & Win Prob")
+            st.markdown(
+                f"""
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="title">Model Margin (favored team)</div>
+    <div class="num">{favored_str}</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">Model Home Line (sportsbook)</div>
+    <div class="num">{home_line_model_lbl}</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">Home Win Probability (model)</div>
+    <div class="num">{100*p_home_win_model:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">P({home_line_market_lbl} covers)</div>
+    <div class="num">{100*p_home_cover_model:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">EV (spread @ {int(spread_price)})</div>
+    <div class="num">{ev_spread_model:+.2f}u</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">σ (spread, effective)</div>
+    <div class="num">{sigma_margin_eff:.1f}</div>
+  </div>
+</div>
+""",
+                unsafe_allow_html=True,
             )
-            sos_weight = st.slider(
-                "SOS weight (points)", 0.0, 2.0, 0.6, 0.1, disabled=not adj_sos,
-                help="Max size of the SOS-based margin correction (typical 0.3–1.0)."
+            st.caption("Positive margin favors HOME. Home line = −(Model margin). Effective σ includes any SOS/SOR/GC scaling.")
+
+        with cR:
+            st.subheader("Totals")
+            st.markdown(
+                f"""
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="title">Model Total</div>
+    <div class="num">{total_model:.1f}</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">Probability Over {market_total:.1f}</div>
+    <div class="num">{100*p_over_model:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">EV Over (@ {int(total_price)})</div>
+    <div class="num">{ev_total_over:+.2f}u</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">EV Under (@ {int(total_price)})</div>
+    <div class="num">{ev_total_under:+.2f}u</div>
+  </div>
+</div>
+""",
+                unsafe_allow_html=True,
             )
-            sos_sigma_pct = st.slider(
-                "SOS → σ multiplier (±%)", 0, 40, 0, 5, disabled=not adj_sos,
-                help="Increase spread σ for easier schedules (less trust), decrease for harder."
-            )
 
-        # Resume: SOR & GC
-        if not (has_SOR and has_GC):
-            st.info("`SOR` and/or `GC` columns not found — resume grounding disabled.", icon="ℹ️")
-            adj_resume = False; sor_w = 0.0; gc_w = 0.0; resume_cap = 0.0; resume_sigma_pct = 0
-        else:
-            adj_resume = st.checkbox(
-                "Adjust for resume (SOR & GC ranks 1=best)",
-                value=False,
-                help="Tiny, capped margin nudge for better/worse results/control; optional σ scaling."
-            )
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                sor_w = st.slider("SOR weight (pts)", 0.0, 1.0, 0.4, 0.1, disabled=not adj_resume,
-                                  help="How much better SOR rank nudges the margin (keep small).")
-            with c2:
-                gc_w  = st.slider("GC weight (pts)", 0.0, 1.0, 0.3, 0.1, disabled=not adj_resume,
-                                  help="How much better GC rank nudges the margin (keep small).")
-            with c3:
-                resume_cap = st.slider("Resume nudge cap (±pts)", 0.0, 1.5, 1.0, 0.1, disabled=not adj_resume,
-                                       help="Caps the combined SOR+GC margin adjustment.")
-            with c4:
-                resume_sigma_pct = st.slider("Resume → σ multiplier (±%)", 0, 30, 0, 5, disabled=not adj_resume,
-                                             help="Decrease σ if average resume/control is strong; increase if weak.")
+        st.subheader("Recommendation")
+        st.markdown(f'<div class="rec-card">{recommendation}</div>', unsafe_allow_html=True)
 
-    with gright:
-        st.markdown("**Current matchup — resume snapshot**")
-        def _rank_center_pair(row, colname):
-            if colname not in df.columns:
-                return "—"
-            r = get_numeric(row, colname)
-            if np.isnan(r) or r <= 0:
-                return "—"
-            c = centered_from_rank(r, n_teams)
-            return f"{int(r)} • {c:+.2f}"
-
-        def _value_delta_pair(row, colname, mean, fmt="{:.2f}"):
-            if colname not in df.columns:
-                return "—"
-            v = get_numeric(row, colname)
-            if np.isnan(v):
-                return "—"
-            d = v - mean
-            return f"{fmt.format(v)} • {d:+.2f}"
-
-        data_rows = []
-        # Ranks
-        data_rows.append({"Metric": "SOS (rank)", home_team: _rank_center_pair(home_row, "SOS"),
-                          away_team: _rank_center_pair(away_row, "SOS")})
-        data_rows.append({"Metric": "SOR (rank)", home_team: _rank_center_pair(home_row, "SOR"),
-                          away_team: _rank_center_pair(away_row, "SOR")})
-        data_rows.append({"Metric": "GC (rank)",  home_team: _rank_center_pair(home_row, "GC"),
-                          away_team: _rank_center_pair(away_row, "GC")})
-        # Values (value • delta vs league mean)
-        data_rows.append({"Metric": "FPI",       home_team: _value_delta_pair(home_row, "FPI", fpi_mean),
-                          away_team: _value_delta_pair(away_row, "FPI", fpi_mean)})
-        data_rows.append({"Metric": "OVRL_EFF",  home_team: _value_delta_pair(home_row, "OVRL_EFF", ovrl_mean),
-                          away_team: _value_delta_pair(away_row, "OVRL_EFF", ovrl_mean)})
-        data_rows.append({"Metric": "OFF_EFF",   home_team: _value_delta_pair(home_row, "OFF_EFF", off_mean),
-                          away_team: _value_delta_pair(away_row, "OFF_EFF", off_mean)})
-        data_rows.append({"Metric": "DEF_EFF",   home_team: _value_delta_pair(home_row, "DEF_EFF", def_mean),
-                          away_team: _value_delta_pair(away_row, "DEF_EFF", def_mean)})
-        snap_df = pd.DataFrame(data_rows).set_index("Metric")
-        st.table(snap_df)
-        st.caption("For ranks: **rank • centered** where centered ∈ [-0.50, +0.50] (higher = harder/better). "
-                   "For values: **value • Δ**, where Δ is the difference vs league average.")
-
+# ---------- Bet Board (always available) ----------
 with tab_bets:
     st.subheader("Bet Board")
     bc = st.container(border=True)
@@ -435,6 +639,7 @@ with tab_bets:
 
     bettor_names = ["Zak", "Tyler", "John"]
     st.markdown("### Log a Bet")
+
     with st.form("bet_form_v2", clear_on_submit=True):
         l1, l2, l3 = st.columns(3)
         with l1:
@@ -442,13 +647,26 @@ with tab_bets:
             sportsbook = st.text_input("Sportsbook", placeholder="(optional)")
             bet_type = st.selectbox("Bet Type", ["Spread", "Total", "Moneyline"])
         with l2:
-            side = st.selectbox("Side", [f"Home ({home_team})", f"Away ({away_team})"]) if bet_type != "Total" else st.selectbox("O/U", ["Over", "Under"])
+            # Team inputs if no CSV
+            if not DATA_READY:
+                home_team_in = st.text_input("Home team", "")
+                away_team_in = st.text_input("Away team", "")
+                side = st.selectbox("Side / O-U", ["Home","Away"] if bet_type!="Total" else ["Over","Under"])
+            else:
+                home_team_in = home_team
+                away_team_in = away_team
+                side = st.selectbox(
+                    "Side / O-U",
+                    [f"Home ({home_team})", f"Away ({away_team})"] if bet_type!="Total" else ["Over","Under"]
+                )
             if bet_type == "Spread":
                 home_based_line = st.number_input("Line (home-based; -3.5 = Home -3.5)", value=-3.5, step=0.5)
+                total_line = None
             elif bet_type == "Total":
                 total_line = st.number_input("Total (pts)", value=float(54.5), step=0.5)
+                home_based_line = None
             else:
-                home_based_line = 0.0
+                home_based_line = 0.0; total_line = None
         with l3:
             price = st.number_input("Price (American, optional)", value=-110, step=5)
             stake = st.number_input("Stake (units or dollars)", value=1.0, min_value=0.0, step=0.5)
@@ -460,17 +678,17 @@ with tab_bets:
                 "bettor": bettor,
                 "book": sportsbook,
                 "type": bet_type,
-                "side": ("Home" if bet_type != "Total" and side.startswith("Home") else ("Away" if bet_type != "Total" else None)),
-                "ou": (side if bet_type == "Total" else None),
-                "home_based_line": (float(home_based_line) if bet_type == "Spread" else None),
-                "total_line": (float(total_line) if bet_type == "Total" else None),
+                "side": ("Home" if bet_type!="Total" and str(side).startswith("Home") else ("Away" if bet_type!="Total" else None)),
+                "ou": (side if bet_type=="Total" else None),
+                "home_based_line": (float(home_based_line) if bet_type=="Spread" and home_based_line is not None else None),
+                "total_line": (float(total_line) if bet_type=="Total" and total_line is not None else None),
                 "price": float(price),
                 "stake": float(stake),
                 "status": "pending",
                 "note": note,
                 "notify_discord": bool(notify_discord),
-                "home_team": home_team,
-                "away_team": away_team,
+                "home_team": home_team_in or "Home",
+                "away_team": away_team_in or "Away",
             }
             row = db_add_bet(record)
             if notify_discord:
@@ -501,20 +719,22 @@ with tab_bets:
             st.subheader(f"{name} — {t['win']}-{t['loss']}-{t['push']}")
             shown_any = False
             for i, b in enumerate(bets):
-                if b.get("bettor") != name or not _pass_filter(b): 
+                if b.get("bettor") != name or not _pass_filter(b):
                     continue
                 shown_any = True
                 with st.container(border=True):
-                    sel_txt = ""
+                    # Use names stored on the bet (works even without CSV loaded)
+                    H = b.get("home_team","Home")
+                    A = b.get("away_team","Away")
                     if b.get("type") == "Total":
-                        sel_txt = f"{b.get('ou')} {b.get('total_line'):.1f}"
+                        sel_txt = f"{b.get('ou')} {float(b.get('total_line',0)):.1f}"
                     elif b.get("type") == "Spread":
-                        who = home_team if b.get("side") == "Home" else away_team
+                        who = H if b.get("side") == "Home" else A
                         line = b.get("home_based_line")
-                        if line is not None and line > 0: line = f"+{line}"
+                        if line is not None and float(line) > 0: line = f"+{float(line)}"
                         sel_txt = f"{b.get('side')} ({who}) {line}"
                     else:
-                        who = home_team if b.get("side") == "Home" else away_team
+                        who = H if b.get("side") == "Home" else A
                         sel_txt = f"{b.get('side')} ({who}) ML"
 
                     created = b.get("created_at","")
@@ -534,31 +754,35 @@ with tab_bets:
                         c1, c2 = st.columns(2)
                         with c1:
                             if st.button("Save", key=f"save_{name}_{i}"):
-                                db_update_bet_status(b.get("id", ""), new_status)
+                                db_update_bet_status(b.get("id",""), new_status)
                                 st.success("Status updated."); st.rerun()
                         with c2:
                             if st.button("Delete", key=f"del_{name}_{i}"):
                                 db_delete_bet(b.get("id","")); st.rerun()
             if not shown_any: st.caption("No bets yet.")
 
+# ---------- Saved Projections ----------
 with tab_saved:
     st.subheader("Saved Projections")
     st.caption("Backed by Supabase (falls back to local if not configured).")
 
     c1, c2 = st.columns([1,1])
     with c1:
-        if st.button("💾 Save current projection"):
-            db_add_projection(st.session_state.get("latest_projection", {}))
-            st.success("Projection saved."); st.rerun()
+        disabled_save = not bool(st.session_state.get("latest_projection"))
+        if st.button("💾 Save current projection", disabled=disabled_save):
+            if disabled_save:
+                st.warning("Nothing to save yet.")
+            else:
+                db_add_projection(st.session_state["latest_projection"])
+                st.success("Projection saved.")
     with c2:
         if st.button("🧹 Clear all saved"):
             if USE_DB:
-                # Dangerous: delete all rows
                 for p in db_list_projections():
                     db_delete_projection(p.get("id",""))
             else:
                 st.session_state["projections"] = []
-            st.rerun()
+            st.success("Cleared.")
 
     projs = db_list_projections()
     if not projs:
@@ -590,78 +814,84 @@ with tab_saved:
                 if st.button("Delete saved", key=f"dels_{p.get('id', j)}"):
                     db_delete_projection(p.get("id","")); st.rerun()
 
+# ---------- Matchup Snapshot ----------
 with tab_snap:
-    st.subheader("Matchup Snapshot")
-    st.caption("Bars compare teams on ranks (higher = better/harder) and efficiencies (0–100 scale). Tooltip shows raw values.")
-
-    def _rank_score(row, col):
-        r = get_numeric(row, col)
-        if np.isnan(r) or r <= 0: return np.nan, "—"
-        score = (n_teams + 1 - r) / n_teams * 100.0  # 1 -> 100
-        return score, f"rank {int(r)}"
-    def _eff_score(row, col):
-        v = get_numeric(row, col)
-        if np.isnan(v): return np.nan, "—"
-        return float(v), f"{v:.1f}"
-    def _fpi_score(row):
-        v = get_numeric(row, "FPI")
-        if np.isnan(v): return np.nan, "—"
-        rng = max(1e-6, float(fpi_max - fpi_min))
-        score = (float(v) - float(fpi_min)) / rng * 100.0
-        return score, f"{v:.2f}"
-
-    metrics = [
-        ("Strength of Schedule (rank)", "SOS", "rank"),
-        ("Strength of Record (rank)",   "SOR", "rank"),
-        ("Game Control (rank)",         "GC",  "rank"),
-        ("Football Power Index",        "FPI", "fpi"),
-        ("Overall Efficiency",          "OVRL_EFF", "eff"),
-        ("Offensive Efficiency",        "OFF_EFF",  "eff"),
-        ("Defensive Efficiency",        "DEF_EFF",  "eff"),
-        ("Special Teams Efficiency",    "SP_EFF",   "eff"),
-    ]
-
-    rows = []
-    for label, col, typ in metrics:
-        if col not in df.columns: 
-            continue
-        if typ == "rank":
-            hs, hd = _rank_score(home_row, col)
-            as_, ad = _rank_score(away_row, col)
-        elif typ == "fpi":
-            hs, hd = _fpi_score(home_row)
-            as_, ad = _fpi_score(away_row)
-        else:
-            hs, hd = _eff_score(home_row, col)
-            as_, ad = _eff_score(away_row, col)
-        rows += [
-            {"MetricNice": label, "Team": home_team, "Score": hs, "Display": hd},
-            {"MetricNice": label, "Team": away_team, "Score": as_, "Display": ad},
-        ]
-    longdf = pd.DataFrame(rows).dropna()
-    order = [m[0] for m in metrics if m[1] in df.columns]
-
-    if alt is not None and not longdf.empty:
-        chart = (
-            alt.Chart(longdf)
-            .mark_bar(size=22)
-            .encode(
-                y=alt.Y("MetricNice:N", sort=list(reversed(order)),
-                        axis=alt.Axis(title=None, labelLimit=260)),
-                x=alt.X("Score:Q", title="Scaled score (0–100)",
-                        scale=alt.Scale(domain=[0, 100])),
-                color=alt.Color("Team:N", legend=alt.Legend(orient="bottom")),
-                tooltip=["Team:N","MetricNice:N","Display:N"]
-            )
-            .properties(height=alt.Step(30))
-        )
-        st.altair_chart(chart, use_container_width=True)
+    if not DATA_READY:
+        st.info("Upload a CSV to view the matchup snapshot.", icon="ℹ️")
     else:
-        if longdf.empty:
-            st.info("Snapshot unavailable for this CSV.")
-        else:
-            st.dataframe(longdf.pivot_table(index="MetricNice", columns="Team", values="Display", aggfunc="first"))
+        st.subheader("Matchup Snapshot")
+        st.caption("Bars compare teams on ranks (higher = better/harder) and efficiencies (0–100 scale). Tooltip shows raw values.")
 
+        def _rank_score(row, col):
+            r = get_numeric(row, col)
+            if np.isnan(r) or r <= 0: return np.nan, "—"
+            score = (n_teams + 1 - r) / n_teams * 100.0
+            return score, f"rank {int(r)}"
+        def _eff_score(row, col):
+            v = get_numeric(row, col)
+            if np.isnan(v): return np.nan, "—"
+            return float(v), f"{v:.1f}"
+        def _fpi_score(row):
+            v = get_numeric(row, "FPI")
+            if np.isnan(v): return np.nan, "—"
+            rng = max(1e-6, float(fpi_max - fpi_min))
+            score = (float(v) - float(fpi_min)) / rng * 100.0
+            return score, f"{v:.2f}"
+
+        home_row = get_team_row(df, home_team)
+        away_row = get_team_row(df, away_team)
+        (off_mean, def_mean, sp_mean, ovrl_mean, fpi_mean, fpi_min, fpi_max) = league_means(df)
+
+        metrics = [
+            ("Strength of Schedule (rank)", "SOS", "rank"),
+            ("Strength of Record (rank)",   "SOR", "rank"),
+            ("Game Control (rank)",         "GC",  "rank"),
+            ("Football Power Index",        "FPI", "fpi"),
+            ("Overall Efficiency",          "OVRL_EFF", "eff"),
+            ("Offensive Efficiency",        "OFF_EFF",  "eff"),
+            ("Defensive Efficiency",        "DEF_EFF",  "eff"),
+            ("Special Teams Efficiency",    "SP_EFF",   "eff"),
+        ]
+
+        rows = []
+        for label, col, typ in metrics:
+            if col not in df.columns: 
+                continue
+            if typ == "rank":
+                hs, hd = _rank_score(home_row, col); as_, ad = _rank_score(away_row, col)
+            elif typ == "fpi":
+                hs, hd = _fpi_score(home_row);        as_, ad = _fpi_score(away_row)
+            else:
+                hs, hd = _eff_score(home_row, col);   as_, ad = _eff_score(away_row, col)
+            rows += [
+                {"MetricNice": label, "Team": home_team, "Score": hs, "Display": hd},
+                {"MetricNice": label, "Team": away_team, "Score": as_, "Display": ad},
+            ]
+        longdf = pd.DataFrame(rows).dropna()
+        order = [m[0] for m in metrics if m[1] in df.columns]
+
+        if alt is not None and not longdf.empty:
+            chart = (
+                alt.Chart(longdf)
+                .mark_bar(size=22)
+                .encode(
+                    y=alt.Y("MetricNice:N", sort=list(reversed(order)),
+                            axis=alt.Axis(title=None, labelLimit=260)),
+                    x=alt.X("Score:Q", title="Scaled score (0–100)", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color("Team:N", legend=alt.Legend(orient="bottom")),
+                    tooltip=["Team:N","MetricNice:N","Display:N"]
+                )
+                .properties(height=alt.Step(30))
+            )
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            if longdf.empty:
+                st.info("Snapshot unavailable for this CSV.")
+            else:
+                st.dataframe(longdf.pivot_table(index="MetricNice", columns="Team",
+                                                values="Display", aggfunc="first"))
+
+# ---------- Model Guide ----------
 with tab_guide:
     st.subheader("Model Guide")
     st.markdown("""
@@ -679,289 +909,13 @@ with tab_guide:
 
 **How to read the snapshot numbers**
 
-- **Ranks (SOS/SOR/GC):** each cell shows `rank • centered`, where  
-  `centered = ((N + 1 − rank)/N) − 0.5` → **−0.50 to +0.50**.  
-  Positive = **harder/better**; negative = **easier/weaker**.  
-  We use these centered values for small, optional **margin nudges** and **σ scaling**.
-- **Values (FPI & efficiencies):** each cell shows `value • Δ`, where  
-  **Δ** is **value minus league average**. Positive means **above-average**.
+- **Ranks (SOS/SOR/GC):** `rank • centered` where centered ∈ **[-0.50, +0.50]** (higher = harder/better).  
+- **Values (FPI & efficiencies):** `value • Δ` where Δ is **value − league average**.
 
 **Key outputs**
 
-- **Model Margin (favored team)** — who the model favors and by how much.  
-  **Model Home Line** is the sportsbook notation: it’s **negative** when the home team is favored (Home line = −Model margin).
+- **Model Margin (favored team)** — shows who’s favored and by how much.  
+  **Model Home Line** is the sportsbook notation: **negative** when the home team is favored (Home line = −Model margin).
 - **Model/Blended Totals**, **Rounded (median) scores**, **probabilities/EV** based on **σ (spread/total)**.
-- **σ (spread, effective)** shows the volatility **after** any SOS/SOR/GC scaling.
-
-**Adjustments (bottom-line)**
-
-- **Home Field Advantage**: adds directly to the home margin.
-- **Base Total**: starting point for totals before matchup/weather.
-- **α (OFF vs DEF)**: how much offenses vs defenses move the total.
-- **β (Special Teams)**: small nudge; keep modest.
-- **σ (spread/total)**: uncertainty knobs. Larger ⇒ probabilities closer to 50%.
-- **Neutral site / Indoors**: remove HFA / ignore weather.
-
-**Grounding (optional)**
-
-- **SOS (1 = hardest schedule to date)**  
-  • **Margin**: harder schedule gets a small bump; easier gets a small trim (via *SOS weight*).  
-  • **σ scaling**: easier schedules widen σ (less trust), harder narrow σ slightly.
-
-- **Resume: SOR & GC (1 = best)**  
-  • **Margin**: tiny, **capped** nudge using *SOR weight* and *GC weight*.  
-  • **σ scaling**: strong average resume/control → slightly smaller σ; weak → slightly larger.
-
-**When to toggle grounding**
-- Early/mid-season or when resumes/schedules differ a lot.  
-- Late season, or if you prefer the raw FPI/efficiency view, leave off.
+- **σ (spread, effective)** shows post-grounding volatility.
 """)
-
-# ---------- PAGE SEPARATOR BEFORE RESULTS ----------
-st.markdown('<div class="page-sep"></div>', unsafe_allow_html=True)
-
-# ---------- Core Modeling ----------
-FPI_h = get_numeric(home_row, "FPI");  FPI_a = get_numeric(away_row, "FPI")
-OFF_h = get_numeric(home_row, "OFF_EFF"); OFF_a = get_numeric(away_row, "OFF_EFF")
-DEF_h = get_numeric(home_row, "DEF_EFF"); DEF_a = get_numeric(away_row, "DEF_EFF")
-SP_h  = get_numeric(home_row, "SP_EFF");  SP_a  = get_numeric(away_row, "SP_EFF")
-
-# Base spread (home margin)
-spread_neutral = (FPI_h - FPI_a) if (not np.isnan(FPI_h) and not np.isnan(FPI_a)) else 0.0
-spread_model = spread_neutral if neutral_site else spread_neutral + hfa_pts  # + = home better
-
-# Grounding: SOS
-has_SOS = "SOS" in df.columns
-hard_h = hard_a = 0.0
-if 'adj_sos' in locals() and adj_sos and has_SOS:
-    sos_h_rank = get_numeric(home_row, "SOS"); sos_a_rank = get_numeric(away_row, "SOS")
-    hard_h = centered_from_rank(sos_h_rank, n_teams)
-    hard_a = centered_from_rank(sos_a_rank, n_teams)
-    spread_model += sos_weight * (hard_h - hard_a)
-
-# Grounding: Resume (SOR & GC)
-has_SOR = "SOR" in df.columns
-has_GC  = "GC"  in df.columns
-sor_h = sor_a = gc_h = gc_a = 0.0
-if 'adj_resume' in locals() and adj_resume and has_SOR and has_GC:
-    sor_h_rank = get_numeric(home_row, "SOR"); sor_a_rank = get_numeric(away_row, "SOR")
-    gc_h_rank  = get_numeric(home_row, "GC");  gc_a_rank  = get_numeric(away_row, "GC")
-    sor_h = centered_from_rank(sor_h_rank, n_teams); sor_a = centered_from_rank(sor_a_rank, n_teams)
-    gc_h  = centered_from_rank(gc_h_rank, n_teams);  gc_a  = centered_from_rank(gc_a_rank, n_teams)
-    resume_nudge = sor_w * (sor_h - sor_a) + gc_w * (gc_h - gc_a)
-    resume_nudge = float(np.clip(resume_nudge, -resume_cap, resume_cap))
-    spread_model += resume_nudge
-
-# Totals
-off_term = center(OFF_h, off_mean) + center(OFF_a, off_mean)
-def_term = center(DEF_h, def_mean) + center(DEF_a, def_mean)
-sp_term  = center(SP_h,  sp_mean)  + center(SP_a,  sp_mean)
-eff_component = alpha_total * (off_term - def_term) / 2.0
-st_component  = beta_st * (sp_term) / 4.0
-
-weather_adj = 0.0
-if not indoor_roof:
-    if wind_mph > 10: weather_adj -= max(0, (wind_mph - 10)) * 0.15
-    if temp_f < 40:   weather_adj -= (40 - temp_f) * 0.05
-    if temp_f > 85:   weather_adj -= (temp_f - 85) * 0.03
-    precip_map = {"None":0.0, "Light":-0.5, "Moderate":-1.5, "Heavy":-3.0}
-    weather_adj += precip_map.get(precip, 0.0)
-
-total_model = float(np.clip(base_total + eff_component + st_component + weather_adj, 20.0, 90.0))
-
-# Team scores (model) + rounded
-home_pts_model = clamp_nonneg((total_model + spread_model) / 2.0)
-away_pts_model = clamp_nonneg(total_model - home_pts_model)
-home_pts_model_r = int(round(home_pts_model)); away_pts_model_r = int(round(away_pts_model))
-
-# Market blend
-home_line_model = _round_line(model_spread_to_home_line(spread_model))
-blend_home_line = _round_line(blend_weight * market_spread_home + (1.0 - blend_weight) * home_line_model)
-total_blended   = blend_weight * market_total + (1.0 - blend_weight) * total_model
-
-# Blended scores + rounded
-S_b = -blend_home_line
-home_pts_blend = clamp_nonneg((total_blended + S_b) / 2.0)
-away_pts_blend = clamp_nonneg(total_blended - home_pts_blend)
-home_pts_blend_r = int(round(home_pts_blend)); away_pts_blend_r = int(round(away_pts_blend))
-
-# σ scaling (effective) for spread
-sigma_scale = 1.0
-if 'adj_sos' in locals() and adj_sos and has_SOS and sos_sigma_pct:
-    sigma_scale *= 1.0 + (sos_sigma_pct/100.0) * (-(hard_h + hard_a))
-if 'adj_resume' in locals() and adj_resume and has_SOR and has_GC and resume_sigma_pct:
-    avg_resume = (sor_h + sor_a + gc_h + gc_a) / 4.0
-    sigma_scale *= 1.0 + (resume_sigma_pct/100.0) * (-(avg_resume))
-sigma_margin_eff = float(np.clip(sigma_margin * sigma_scale, 3.0, 40.0))
-
-# Probabilities / EV
-p_home_win_model   = normal_cdf(spread_model / max(1e-9, sigma_margin_eff))
-p_home_cover_model = home_cover_probability(spread_model, market_spread_home, sigma_margin_eff)
-p_over_model       = 1.0 - normal_cdf((market_total - total_model) / max(1e-9, sigma_total))
-ev_spread_model    = ev_per_unit(p_home_cover_model, spread_price)
-ev_total_over      = ev_per_unit(p_over_model, total_price)
-ev_total_under     = ev_per_unit(1.0 - p_over_model, total_price)
-
-# Recommendation
-home_spread_str, away_spread_str = format_home_away_spreads(home_team, away_team, market_spread_home)
-spread_pick = home_spread_str if ev_spread_model >= 0 else away_spread_str
-tot_pick = f"Over {market_total:.1f}" if ev_total_over >= ev_total_under else f"Under {market_total:.1f}"
-recommendation = f"{spread_pick} | {tot_pick}"
-
-# Save latest projection for quick save
-model_home_spread_str, _ = format_home_away_spreads(home_team, away_team, home_line_model)
-blended_home_spread_str, _ = format_home_away_spreads(home_team, away_team, blend_home_line)
-st.session_state.latest_projection = {
-    "home_team": home_team, "away_team": away_team,
-    "home_pts": float(home_pts_model), "away_pts": float(away_pts_model),
-    "total_model": float(total_model), "total_blended": float(total_blended),
-    "model_home_spread_str": model_home_spread_str,
-    "blended_home_spread_str": blended_home_spread_str,
-    "recommendation": recommendation,
-}
-
-# ---------- Score Cards ----------
-st.markdown("### 🧾 Score Cards")
-sc1, sc2 = st.columns(2)
-with sc1:
-    st.markdown(f"""
-<div class="score-card score-green">
-  <div class="section-caption">Model Score</div>
-  <div style="font-weight:700; font-size:1.05rem;">
-    {home_team} {home_pts_model:.1f} — {away_team} {away_pts_model:.1f}
-  </div>
-  <div class="small">Rounded (median): {home_team} <b>{home_pts_model_r}</b> — {away_team} <b>{away_pts_model_r}</b></div>
-  <div class="section-caption">Derived from model margin & total.</div>
-</div>
-""", unsafe_allow_html=True)
-with sc2:
-    st.markdown(f"""
-<div class="score-card score-yellow">
-  <div class="section-caption">Blended Score</div>
-  <div style="font-weight:700; font-size:1.05rem;">
-    {home_team} {home_pts_blend:.1f} — {away_team} {away_pts_blend:.1f}
-  </div>
-  <div class="small">Rounded (median): {home_team} <b>{home_pts_blend_r}</b> — {away_team} <b>{away_pts_blend_r}</b></div>
-  <div class="section-caption">Blend of model and market lines via weight w.</div>
-</div>
-""", unsafe_allow_html=True)
-
-mc1, mc2, mc3 = st.columns(3)
-with mc1:
-    st.markdown(f"""
-<div class="value-chip">
-  <div class="label">Model Home Line</div>
-  <div class="value">{format_home_away_spreads(home_team, away_team, home_line_model)[0]}</div>
-</div>""", unsafe_allow_html=True)
-with mc2:
-    st.markdown(f"""
-<div class="value-chip">
-  <div class="label">Blended Home Line</div>
-  <div class="value">{format_home_away_spreads(home_team, away_team, blend_home_line)[0]}</div>
-</div>""", unsafe_allow_html=True)
-with mc3:
-    st.markdown(f"""
-<div class="value-chip">
-  <div class="label">Market Home Line</div>
-  <div class="value">{format_home_away_spreads(home_team, away_team, market_spread_home)[0]}</div>
-</div>""", unsafe_allow_html=True)
-
-tc1, tc2, tc3 = st.columns(3)
-with tc1:
-    st.markdown(f"""
-<div class="value-chip">
-  <div class="label">Model Total</div>
-  <div class="value">{total_model:.1f}</div>
-</div>""", unsafe_allow_html=True)
-with tc2:
-    st.markdown(f"""
-<div class="value-chip">
-  <div class="label">Blended Total</div>
-  <div class="value">{total_blended:.1f}</div>
-</div>""", unsafe_allow_html=True)
-with tc3:
-    st.markdown(f"""
-<div class="value-chip">
-  <div class="label">Market Total</div>
-  <div class="value">{market_total:.1f}</div>
-</div>""", unsafe_allow_html=True)
-
-st.markdown("---")
-
-# ---------- Prediction Details ----------
-st.markdown("## 📊 Prediction Details (always shown)")
-st.write(f"**Matchup:** {away_team} @ {home_team}{' (Neutral)' if neutral_site else ''}")
-
-home_line_model_lbl, _ = format_home_away_spreads(home_team, away_team, home_line_model)
-home_line_market_lbl, _ = format_home_away_spreads(home_team, away_team, market_spread_home)
-
-if abs(spread_model) < 0.05:
-    favored_str = "Pick'em"
-else:
-    favored_team = home_team if spread_model > 0 else away_team
-    favored_str = f"{favored_team} by {abs(spread_model):.1f}"
-
-cL, cR = st.columns(2)
-with cL:
-    st.subheader("Spread & Win Prob")
-    st.markdown(
-        f"""
-<div class="stat-grid">
-  <div class="stat-card">
-    <div class="title">Model Margin (favored team)</div>
-    <div class="num">{favored_str}</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">Model Home Line (sportsbook)</div>
-    <div class="num">{home_line_model_lbl}</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">Home Win Probability (model)</div>
-    <div class="num">{100*p_home_win_model:.1f}%</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">P({home_line_market_lbl} covers)</div>
-    <div class="num">{100*p_home_cover_model:.1f}%</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">EV (spread @ {int(spread_price)})</div>
-    <div class="num">{ev_spread_model:+.2f}u</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">σ (spread, effective)</div>
-    <div class="num">{sigma_margin_eff:.1f}</div>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-    st.caption("Positive margin favors HOME. Home line = −(Model margin). Effective σ includes any SOS/SOR/GC scaling.")
-
-with cR:
-    st.subheader("Totals")
-    st.markdown(
-        f"""
-<div class="stat-grid">
-  <div class="stat-card">
-    <div class="title">Model Total</div>
-    <div class="num">{total_model:.1f}</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">Probability Over {market_total:.1f}</div>
-    <div class="num">{100*p_over_model:.1f}%</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">EV Over (@ {int(total_price)})</div>
-    <div class="num">{ev_total_over:+.2f}u</div>
-  </div>
-  <div class="stat-card">
-    <div class="title">EV Under (@ {int(total_price)})</div>
-    <div class="num">{ev_total_under:+.2f}u</div>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-st.subheader("Recommendation")
-st.markdown(f'<div class="rec-card">{recommendation}</div>', unsafe_allow_html=True)
