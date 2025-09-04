@@ -534,7 +534,7 @@ with tab_adj:
                     resume_sigma_pct = st.slider("Resume → σ multiplier (±%)", 0, 30, 0, 5, disabled=not adj_resume)
 
         with gright:
-            st.markdown("**Current matchup — resume snapshot**")
+            st.markdown("**Current Matchup | Resume Snapshot**")
             def _rank_center_pair(row, colname):
                 if colname not in df.columns:
                     return "—"
@@ -730,7 +730,7 @@ with tab_adj:
 </div>""", unsafe_allow_html=True)
 
         st.markdown("---")
-        st.markdown("## 📊 Prediction Details (always shown)")
+        st.markdown("## 📊 Prediction Details")
         st.write(f"**Matchup:** {away_team} @ {home_team}{' (Neutral)' if neutral_site else ''}")
 
         home_line_model_lbl, _ = format_home_away_spreads(home_team, away_team, home_line_model)
