@@ -60,7 +60,7 @@ from supabase import create_client, Client
 def get_sb() -> Client | None:
     cfg = st.secrets.get("supabase", {})
     url = cfg.get("url") or os.environ.get("SB_URL")
-    key = cfg.get("anon_key") or os.environ.get("SB_ANON_KEY")
+    key = cfg.get("anon_key") or os.environ.get("SB_SERVICE_KEY")
     if not url or not key:
         return None
     return create_client(url, key)
