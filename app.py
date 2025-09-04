@@ -59,8 +59,8 @@ from supabase import create_client, Client
 @st.cache_resource
 def get_sb() -> Client | None:
     cfg = st.secrets.get("supabase", {})
-    url = cfg.get("url") or os.environ.get("SUPABASE_URL")
-    key = cfg.get("anon_key") or os.environ.get("SUPABASE_ANON_KEY")
+    url = cfg.get("url") or os.environ.get("SB_URL")
+    key = cfg.get("anon_key") or os.environ.get("SB_ANON_KEY")
     if not url or not key:
         return None
     return create_client(url, key)
