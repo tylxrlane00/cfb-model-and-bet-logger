@@ -1,1032 +1,967 @@
-# app.py — CFB PPA Monte Carlo Predictor + Market Blend + EV + Bet Board + Projections Manager
-# Run locally:  pip install streamlit pandas numpy requests supabase python-dateutil && streamlit run app.py
+# app.py — 🥜 The Goober Model (CFB)
+# - Supabase persistence for bets + saved projections
+# - Discord notify via Supabase Edge Function "notify-bet"
+# - Weekly roundup is an Edge Function on a schedule (not in this file)
+# - Polished UI: score cards, prediction details, grounding snapshot, matchup bars, bet board
 
-import os, io, json, time
+import math
+from datetime import datetime
+import os
+import uuid
 import numpy as np
 import pandas as pd
 import streamlit as st
-import requests
-from typing import Optional, List, Dict, Tuple
+
+# Optional chart lib for "Matchup Snapshot"
+try:
+    import altair as alt
+except Exception:
+    alt = None
+
+# ---------- Styling ----------
+st.set_page_config(page_title="🥜 The Goober Model", layout="wide")
+st.markdown(
+    """
+<style>
+.page-sep { height: 2px; background: linear-gradient(90deg, #0ea5e933, #22c55e55, #f59e0b33);
+            border-radius: 999px; margin: 18px 0 14px 0; }
+/* score cards */
+.score-card { padding:16px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);
+              margin-bottom:14px; }
+.score-green { background: rgba(16,185,129,0.16); }
+.score-yellow{ background: rgba(234,179,8,0.16); }
+.section-caption { font-size:0.85rem; opacity:0.75; }
+.small { font-size:.9rem; opacity:.9; }
+/* chips under score cards */
+.value-chip { padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);
+              background: rgba(255,255,255,0.03); margin-bottom:14px; }
+.value-chip .label { font-size:0.85rem; opacity:0.75; margin-bottom:4px; }
+.value-chip .value { font-size:1.25rem; font-weight:700; }
+/* big recommendation pill */
+.rec-card { background: rgba(16,185,129,0.16); border:1px solid rgba(16,185,129,0.35);
+            padding:16px 18px; border-radius:12px; font-weight:800; font-size:1.1rem; }
+/* stat tiles for Prediction Details */
+.stat-grid { display:grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap:12px; }
+.stat-card { padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);
+             background: rgba(255,255,255,0.03); }
+.stat-card .title { font-size:0.85rem; opacity:0.8; margin-bottom:4px; }
+.stat-card .num { font-weight:700; font-size:1.15rem; }
+/* helpers */
+.muted { opacity:.85; }
+/* bet status badge */
+.status-badge { display:inline-block; padding:2px 8px; border-radius:999px;
+                font-size:0.75rem; font-weight:700; color:#fff; margin-left:8px; }
+.status-pending { background:#64748b; }
+.status-win { background:#16a34a; }
+.status-loss { background:#dc2626; }
+.status-push { background:#f59e0b; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------- Supabase (optional) ----------
 from supabase import create_client, Client
 
-# =============================== Defaults ===============================
-DEFAULT_BASE = {
-    "BASE_TEAM_POINTS": 27.0,      # used when CSV mu_pts is not present
-    "RATING_SCALE_TO_POINTS": 7.5, # rating sd => points scaling (used for both legacy & ratings)
-    "MIN_SD_POINTS": 10.0,
-    "MAX_SD_POINTS": 24.0,
-}
-
-# Legacy model weights (used if ratings columns are missing)
-DEFAULT_OFF_WEIGHTS = {
-    "offense.ppa": 0.35,
-    "offense.successRate": 0.20,
-    "offense.explosiveness": 0.10,
-    "offense.powerSuccess": 0.05,
-    "offense.pointsPerOpportunity": 0.10,
-    "offense.fieldPosition.averageStart": 0.05,
-    "offense.standardDowns.successRate": 0.05,
-    "offense.passingDowns.ppa": 0.05,
-    "offense.rushingPlays.ppa": 0.025,
-    "offense.passingPlays.ppa": 0.025,
-}
-DEFAULT_DEF_WEIGHTS = {
-    "defense.ppa": -0.35,
-    "defense.successRate": -0.20,
-    "defense.explosiveness": -0.10,
-    "defense.powerSuccess": -0.05,
-    "defense.stuffRate": +0.075,
-    "defense.pointsPerOpportunity": -0.10,
-    "defense.fieldPosition.averageStart": -0.05,
-    "defense.havoc.total": +0.075,
-    "defense.rushingPlays.ppa": -0.025,
-    "defense.passingPlays.ppa": -0.025,
-}
-
-# Required columns (legacy component features)
-REQUIRED_COLUMNS = [
-    "team",
-    "offense.ppa","offense.successRate","offense.explosiveness",
-    "offense.powerSuccess","offense.pointsPerOpportunity",
-    "offense.fieldPosition.averageStart","offense.standardDowns.successRate",
-    "offense.passingDowns.ppa","offense.rushingPlays.ppa","offense.passingPlays.ppa",
-    "defense.ppa","defense.successRate","defense.explosiveness","defense.powerSuccess",
-    "defense.stuffRate","defense.pointsPerOpportunity","defense.fieldPosition.averageStart",
-    "defense.havoc.total","defense.rushingPlays.ppa","defense.passingPlays.ppa",
-]
-
-# Optional new columns coming from build_weekly_team_csv.py (ratings/volatility)
-OPTIONAL_NEW_COLS = [
-    "off_rating", "def_rating",   # opponent-adjusted ratings
-    "mu_pts", "hfa_pts",          # league baseline & HFA estimate (reference)
-    "vol_points", "games_played"  # team point volatility & GP
-]
-
-BET_LOG_COLS = [
-    "id","timestamp","room","bettor","home","away","bet_type","pick","odds","stake",
-    "model_spread","model_total","blended_spread","blended_total","recommendation",
-    "ev_best","description","result"
-]
-SAVED_PROJ_COLS = [
-    "id","timestamp","room","home","away","proj_home","proj_away","model_spread",
-    "model_total","blended_spread","blended_total","winner","recommendation","ev_best",
-    "weather_mult","hfa_points","n_sims","seed",
-    # extra saved context
-    "market_spread_home","market_total","market_weight",
-    "spread_odds","total_odds","temp_f","wind_mph","precip","indoor","neutral",
-]
-
-LOCAL_SETTINGS_FILE = "model_settings.json"
-
-# =============================== Supabase helpers ===============================
-def _supabase_client() -> Optional[Client]:
-    # If SB_SERVICE_KEY not set, we quietly use CSV persistence
-    url = st.secrets.get("SB_URL")
-    key = st.secrets.get("SB_SERVICE_KEY") or st.secrets.get("SB_SERVICE_ROLE_KEY")
+@st.cache_resource
+def get_sb() -> Client | None:
+    cfg = st.secrets.get("supabase", {})
+    url = cfg.get("url") or os.environ.get("SUPABASE_URL")
+    key = cfg.get("anon_key") or os.environ.get("SUPABASE_ANON_KEY")
     if not url or not key:
         return None
     return create_client(url, key)
 
-def persistence_mode():
-    return "supabase" if _supabase_client() is not None else "local_csv"
+sb: Client | None = get_sb()
+USE_DB = sb is not None
 
-def _room() -> str:
-    return st.session_state.get("room", st.secrets.get("ROOM", "main"))
+# ---------- Utilities ----------
+def normal_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-# Settings persistence (Supabase JSON or local JSON)
-def load_settings() -> Tuple[Dict, Dict, Dict]:
-    sb = _supabase_client()
-    if sb:
-        try:
-            res = sb.table("model_settings").select("*").eq("room", _room()).order("id", desc=True).limit(1).execute()
-            if getattr(res, "error", None):
-                st.info("Using default model settings (Supabase error).")
-            else:
-                rows = res.data or []
-                if rows:
-                    row = rows[0]
-                    base = row.get("base_params") or {}
-                    off = row.get("off_weights") or {}
-                    deff = row.get("def_weights") or {}
-                    return (
-                        {**DEFAULT_BASE, **base},
-                        {**DEFAULT_OFF_WEIGHTS, **off},
-                        {**DEFAULT_DEF_WEIGHTS, **deff},
-                    )
-        except Exception:
-            st.info("Using default model settings (Supabase settings table missing).")
-    # Local file fallback
-    if os.path.exists(LOCAL_SETTINGS_FILE):
-        try:
-            with open(LOCAL_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            base = data.get("base_params", {})
-            off = data.get("off_weights", {})
-            deff = data.get("def_weights", {})
-            return (
-                {**DEFAULT_BASE, **base},
-                {**DEFAULT_OFF_WEIGHTS, **off},
-                {**DEFAULT_DEF_WEIGHTS, **deff},
-            )
-        except Exception:
-            st.info("Using default model settings (local settings unreadable).")
-    return DEFAULT_BASE.copy(), DEFAULT_OFF_WEIGHTS.copy(), DEFAULT_DEF_WEIGHTS.copy()
+def american_to_decimal(american: float) -> float:
+    a = float(american)
+    return 1.0 + (100.0/abs(a) if a < 0 else a/100.0)
 
-def save_settings(base_params: Dict, off_weights: Dict, def_weights: Dict) -> bool:
-    sb = _supabase_client()
-    payload = {
-        "room": _room(),
-        "base_params": base_params,
-        "off_weights": off_weights,
-        "def_weights": def_weights,
-        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    if sb:
-        try:
-            res = sb.table("model_settings").insert(payload).execute()
-            if getattr(res, "error", None):
-                st.warning(f"Supabase settings insert error: {res.error}")
-            else:
-                return True
-        except Exception as e:
-            st.warning(f"Supabase settings insert failed: {e}")
-    # Local fallback
+def ev_per_unit(p_win: float, american: float) -> float:
+    dec = american_to_decimal(american)
+    return p_win * (dec - 1.0) - (1.0 - p_win) * 1.0
+
+def coerce_float(x):
     try:
-        with open(LOCAL_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        return True
-    except Exception as e:
-        st.error(f"Failed to save local settings: {e}")
-        return False
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return np.nan
 
-# Generic row persistence (Supabase then CSV fallback)
-def persist_row(row: dict, table: str) -> bool:
-    mode = persistence_mode()
-    row = dict(row); row.setdefault("room", _room())
-    if mode == "supabase":
-        try:
-            sb = _supabase_client(); assert sb is not None
-            res = sb.table(table).insert(row).execute()
-            if getattr(res, "error", None):
-                st.warning(f"Supabase insert error: {res.error}")
-                return False
-            return True
-        except Exception as e:
-            st.warning(f"Supabase insert failed, falling back to CSV: {e}")
-    # CSV fallback (append)
+def center(val, mean):
+    if np.isnan(val) or np.isnan(mean):
+        return 0.0
+    return float(val) - float(mean)
+
+def get_numeric(row: pd.Series, col: str) -> float:
+    if col not in row:
+        return np.nan
+    return coerce_float(row[col])
+
+def clamp_nonneg(x: float) -> float:
+    return max(0.0, float(x))
+
+def _round_line(val: float, eps: float = 0.05) -> float:
+    """Round to 0.1; squash tiny magnitudes to 0 (avoid -0.0; clean PK)."""
+    if val is None or np.isnan(val):
+        return 0.0
+    r = round(float(val), 1)
+    return 0.0 if abs(r) < eps else r
+
+def format_home_away_spreads(home_team: str, away_team: str, home_line: float) -> tuple[str, str]:
+    """home_line: sportsbook home line (home favored NEGATIVE)."""
+    L = _round_line(home_line)
+    n = abs(L)
+    if L < 0:
+        return f"{home_team} -{n:.1f}", f"{away_team} +{n:.1f}"
+    elif L > 0:
+        return f"{home_team} +{n:.1f}", f"{away_team} -{n:.1f}"
+    else:
+        return f"{home_team} PK", f"{away_team} PK"
+
+def model_spread_to_home_line(spread_model: float) -> float:
+    """Model margin is HOME − AWAY. Sportsbook home line is negative if home favored."""
+    return -spread_model
+
+def home_cover_probability(spread_model: float, home_market_line: float, sigma_margin: float) -> float:
+    """Margin M ~ N(spread_model, σ). Home covers line L iff M > -L."""
+    z = ((-home_market_line) - spread_model) / max(1e-9, sigma_margin)
+    return 1.0 - normal_cdf(z)
+
+@st.cache_data
+def league_means(df: pd.DataFrame):
+    off_mean = pd.to_numeric(df.get("OFF_EFF", pd.Series([])), errors="coerce").mean(skipna=True)
+    def_mean = pd.to_numeric(df.get("DEF_EFF", pd.Series([])), errors="coerce").mean(skipna=True)
+    sp_mean  = pd.to_numeric(df.get("SP_EFF",  pd.Series([])), errors="coerce").mean(skipna=True)
+    ovrl_mean= pd.to_numeric(df.get("OVRL_EFF",pd.Series([])), errors="coerce").mean(skipna=True)
+    fpi_mean = pd.to_numeric(df.get("FPI",      pd.Series([])), errors="coerce").mean(skipna=True)
+    fpi_min  = pd.to_numeric(df.get("FPI", pd.Series([])), errors="coerce").min(skipna=True)
+    fpi_max  = pd.to_numeric(df.get("FPI", pd.Series([])), errors="coerce").max(skipna=True)
+    return off_mean, def_mean, sp_mean, ovrl_mean, fpi_mean, fpi_min, fpi_max
+
+def get_team_row(df: pd.DataFrame, team: str) -> pd.Series:
+    row = df.loc[df["Team"] == team]
+    return row.iloc[0] if not row.empty else pd.Series(dtype=object)
+
+def centered_from_rank(rank: float, n_teams: int) -> float:
+    """
+    Convert a rank (1 = best/hardest) into centered score in [-0.5, +0.5].
+    +0.5 means rank #1, -0.5 means rank ~N (easiest/worst).
+    """
+    if np.isnan(rank) or rank <= 0 or n_teams <= 0:
+        return 0.0
+    return ((n_teams + 1 - rank) / n_teams) - 0.5
+
+def status_badge_html(status: str) -> str:
+    s = (status or "pending").lower()
+    cls = {"pending":"status-pending","win":"status-win","loss":"status-loss","push":"status-push"}.get(s,"status-pending")
+    return f"<span class='status-badge {cls}'>{s.capitalize()}</span>"
+
+# ---------- Supabase helpers (db) + fallback ----------
+def db_list_bets():
+    if USE_DB:
+        res = sb.table("bets").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    # fallback (local memory)
+    return st.session_state.get("bets", [])
+
+def db_add_bet(rec: dict):
+    if USE_DB:
+        ins = sb.table("bets").insert(rec).select("*").single().execute()
+        return ins.data
+    # fallback
+    rec = rec.copy()
+    rec["id"] = rec.get("id") or str(uuid.uuid4())
+    st.session_state.setdefault("bets", []).insert(0, rec)
+    return rec
+
+def db_update_bet_status(bet_id: str, status: str):
+    if USE_DB:
+        sb.table("bets").update({"status": status}).eq("id", bet_id).execute()
+        return
+    # fallback
+    arr = st.session_state.get("bets", [])
+    for x in arr:
+        if x.get("id") == bet_id:
+            x["status"] = status
+
+def db_delete_bet(bet_id: str):
+    if USE_DB:
+        sb.table("bets").delete().eq("id", bet_id).execute()
+        return
+    arr = st.session_state.get("bets", [])
+    st.session_state["bets"] = [x for x in arr if x.get("id") != bet_id]
+
+def db_list_projections():
+    if USE_DB:
+        res = sb.table("projections").select("*").order("created_at", desc=True).execute()
+        return res.data or []
+    return st.session_state.get("projections", [])
+
+def db_add_projection(p: dict):
+    if USE_DB:
+        sb.table("projections").insert(p).execute()
+        return
+    st.session_state.setdefault("projections", []).insert(0, p)
+
+def db_delete_projection(pid: str):
+    if USE_DB:
+        sb.table("projections").delete().eq("id", pid).execute()
+        return
+    arr = st.session_state.get("projections", [])
+    st.session_state["projections"] = [x for x in arr if x.get("id") != pid]
+
+def send_discord_bet(bet: dict):
+    if not USE_DB:
+        return
     try:
-        path = f"{table}.csv"
-        df = pd.DataFrame([row])
-        if os.path.exists(path): df = pd.concat([pd.read_csv(path), df], ignore_index=True)
-        df.to_csv(path, index=False)
-        return True
+        # Send either { op: "notify-bet", bet: {...} } or just the bet object.
+        sb.functions.invoke("discord-bot", body={"op": "notify-bet", "bet": bet})
     except Exception as e:
-        st.error(f"Local CSV persist failed: {e}")
-        return False
+        st.warning(f"Discord notify failed: {e}")
 
-def update_row(table: str, row_id: int, fields: dict) -> bool:
-    if persistence_mode() != "supabase":
-        st.warning("Updates require Supabase (CSV fallback is append-only).")
-        return False
-    try:
-        sb = _supabase_client(); assert sb is not None
-        res = sb.table(table).update(fields).eq("id", row_id).execute()
-        if getattr(res, "error", None):
-            st.warning(f"Supabase update error: {res.error}")
-            return False
-        return True
-    except Exception as e:
-        st.warning(f"Supabase update failed: {e}")
-        return False
 
-def delete_row(table: str, row_id: int) -> bool:
-    if persistence_mode() != "supabase":
-        path = f"{table}.csv"
-        if os.path.exists(path):
-            try:
-                df = pd.read_csv(path)
-                if "id" in df.columns:
-                    df = df[df["id"] != row_id]
-                    df.to_csv(path, index=False)
-                    return True
-            except Exception as e:
-                st.warning(f"Local CSV delete failed: {e}")
-        st.warning("Delete requires Supabase or an 'id' column in local CSV.")
-        return False
-    try:
-        sb = _supabase_client(); assert sb is not None
-        res = sb.table(table).delete().eq("id", row_id).execute()
-        if getattr(res, "error", None):
-            st.warning(f"Supabase delete error: {res.error}")
-            return False
-        return True
-    except Exception as e:
-        st.warning(f"Supabase delete failed: {e}")
-        return False
+# ---------- Header & CSV ----------
+st.title("🥜 The Goober Model")
+st.caption("College Football Predictor — FPI & efficiencies with weather, market, and optional SOS / SOR / GC grounding. (Supabase-enabled)")
 
-def _empty_table(table: str) -> pd.DataFrame:
-    if table == "bet_logs": return pd.DataFrame(columns=BET_LOG_COLS)
-    if table == "saved_projections": return pd.DataFrame(columns=SAVED_PROJ_COLS)
-    return pd.DataFrame()
+st.sidebar.header("📄 Upload data")
+csv_file = st.sidebar.file_uploader("Combined CSV (FPI + Efficiencies)", type=["csv"], accept_multiple_files=False)
 
-def load_table(table: str) -> pd.DataFrame:
-    df = None
-    if persistence_mode() == "supabase":
-        try:
-            sb = _supabase_client(); assert sb is not None
-            res = sb.table(table).select("*").eq("room", _room()).order("id", desc=True).limit(500).execute()
-            if getattr(res, "error", None):
-                st.warning(f"Supabase select error: {res.error}")
-            else:
-                data = res.data or []
-                df = pd.DataFrame(data) if data else _empty_table(table)
-        except Exception as e:
-            st.warning(f"Supabase read failed, falling back to CSV: {e}")
-    if df is None:
-        path = f"{table}.csv"
-        if os.path.exists(path):
-            try: df = pd.read_csv(path)
-            except Exception as e:
-                st.warning(f"Failed to read {path}: {e}"); df = _empty_table(table)
-        else:
-            df = _empty_table(table)
-    # Ensure schema for local CSV
-    cols = BET_LOG_COLS if table == "bet_logs" else (SAVED_PROJ_COLS if table == "saved_projections" else [])
-    for c in cols:
-        if c not in df.columns: df[c] = pd.Series(dtype="object")
-    return df
+if not csv_file:
+    st.info("⬅️ Upload your combined CSV to begin.", icon="🔎")
+    st.stop()
 
-# =============================== Discord notify ===============================
-def notify_discord(message: str):
-    url = st.secrets.get("DISCORD_WEBHOOK_URL")
-    if not url:
-        return False, "Discord webhook not configured."
-    try:
-        resp = requests.post(url, json={"content": message}, timeout=8)
-        return (200 <= resp.status_code < 300), f"HTTP {resp.status_code}"
-    except Exception as e:
-        return False, str(e)
+try:
+    df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+except Exception as e:
+    st.error(f"Could not read CSV: {e}")
+    st.stop()
 
-# =============================== Modeling utils ===============================
-def american_odds_profit_per_unit(odds: int) -> float:
-    return 100 / abs(odds) if odds < 0 else odds / 100.0
+required = {"Team", "FPI", "OFF_EFF", "DEF_EFF", "SP_EFF"}
+missing = sorted(list(required - set(df.columns)))
+if missing:
+    st.warning(f"Missing columns: {missing}. The app will still work, but predictions may be weaker.", icon="⚠️")
 
-def ev_from_p(p_win: float, odds: int, p_push: float = 0.0) -> float:
-    profit = american_odds_profit_per_unit(odds)
-    p_loss = max(0.0, 1.0 - p_win - p_push)
-    return p_win * profit - p_loss
+teams = sorted(df["Team"].unique().tolist())
+n_teams = max(1, len(teams))
 
-def bucket_confidence(ev: float, p: float) -> str:
-    if ev >= 0.06 and p >= 0.60: return "STRONG"
-    if ev >= 0.03 and p >= 0.56: return "BET"
-    if ev >= 0.01 and p >= 0.53: return "LEAN"
-    return "PASS"
+cA, cB = st.columns(2)
+with cA:
+    home_team = st.selectbox("Home Team", teams, index=0 if teams else None,
+                             help="Team playing at home (or designated as home).")
+with cB:
+    away_team = st.selectbox("Away Team", teams, index=1 if len(teams) > 1 else 0,
+                             help="Visiting team.")
+if home_team == away_team:
+    st.warning("Please select two different teams.", icon="⚠️")
+    st.stop()
 
-def load_csv(uploaded):
-    if "csv_bytes" in st.session_state:
-        try: return pd.read_csv(io.BytesIO(st.session_state["csv_bytes"]))
-        except Exception: st.session_state.pop("csv_bytes", None)
-    if uploaded is not None:
-        data = uploaded.getvalue()
-        st.session_state["csv_bytes"] = data
-        return pd.read_csv(io.BytesIO(data))
-    for path in ("advancedStats.csv", "/mnt/data/advancedStats.csv"):
-        if os.path.exists(path): return pd.read_csv(path)
-    return pd.DataFrame()
+home_row = get_team_row(df, home_team)
+away_row = get_team_row(df, away_team)
+(off_mean, def_mean, sp_mean,
+ ovrl_mean, fpi_mean, fpi_min, fpi_max) = league_means(df)
 
-def coerce_and_impute(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Coerce both required & optional numeric columns
-    numeric_cols = [c for c in REQUIRED_COLUMNS if c != "team"] + [c for c in OPTIONAL_NEW_COLS if c not in ["team","precip"]]
-    for c in numeric_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # Impute only legacy required metrics (ratings may be sparse early season)
-    med = df[[c for c in REQUIRED_COLUMNS if c != "team" and c in df.columns]].median(numeric_only=True)
-    for c in REQUIRED_COLUMNS:
-        if c != "team" and c in df.columns:
-            df[c] = df[c].fillna(med.get(c, 0.0))
-    return df
+# ---------- Tabs ----------
+tab_adj, tab_bets, tab_saved, tab_snap, tab_guide = st.tabs(
+    ["⚙️ Adjustments", "🧾 Bet Board", "💾 Saved Projections", "📌 Matchup Snapshot", "ℹ️ Model Guide"]
+)
 
-def zscore_columns(df: pd.DataFrame, cols: list) -> pd.DataFrame:
-    out = df.copy()
-    for c in cols:
-        if c in out.columns:
-            m = out[c].mean(); s = out[c].std(ddof=0)
-            out[c+"__z"] = 0.0 if (s is None or s == 0 or not np.isfinite(s)) else (out[c] - m) / s
-            out[c+"__z"] = out[c+"__z"].fillna(0.0)
-    return out
+with tab_adj:
+    st.subheader("Model & Market Adjustments")
+    g1, g2, g3, g4 = st.columns(4)
+    with g1:
+        hfa_pts = st.slider("Home Field Advantage (pts)", 0.0, 5.0, 2.5, 0.1,
+            help="Adds to the HOME team’s expected margin. Typical CFB ~2–3 points.")
+        base_total = st.slider("Base Total (league avg)", 40.0, 70.0, 54.0, 0.5,
+            help="Starting point for total points before efficiency & weather nudges.")
+    with g2:
+        alpha_total = st.slider("α (OFF vs DEF)", 0.0, 1.0, 0.30, 0.01,
+            help="How strongly good offense / weak defense pushes totals up (and vice versa).")
+        beta_st = st.slider("β (Special Teams)", 0.0, 0.3, 0.05, 0.01,
+            help="Small nudge from special teams efficiency; keep modest.")
+    with g3:
+        sigma_margin = st.slider("σ (spread) — pts", 6.0, 21.0, 13.0, 0.5,
+            help="How noisy game margins are. Larger σ ⇒ less certain spreads & cover %.")
+        sigma_total = st.slider("σ (total) — pts", 6.0, 21.0, 10.0, 0.5,
+            help="How noisy totals are. Larger σ ⇒ P(Over/Under) closer to 50%.")
+    with g4:
+        neutral_site = st.checkbox("Neutral site", value=False,
+            help="Remove HFA from the spread if played at a neutral site.")
+        indoor_roof = st.checkbox("Indoors / Roof closed", value=False,
+            help="Ignore weather if conditions are controlled (domes, roof closed).")
 
-def team_row(df: pd.DataFrame, team: str) -> pd.Series:
-    row = df.loc[df["team"] == team]
-    if row.empty: raise ValueError(f"Team '{team}' not found")
-    return row.iloc[0]
-
-def composite_rating(row: pd.Series, weights: dict) -> float:
-    s = 0.0
-    for col, w in weights.items():
-        z = row.get(col + "__z", 0.0)
-        if not np.isfinite(z): z = 0.0
-        s += float(w) * float(z)
-    return s
-
-def weather_multiplier(temp_f: float, wind_mph: float, precip: str, indoor: bool) -> float:
-    if indoor: return 1.0
-    mult = 1.0
-    if temp_f <= 25: mult *= 0.90
-    elif temp_f <= 35: mult *= 0.95
-    elif temp_f >= 95: mult *= 0.97
-    elif temp_f >= 90: mult *= 0.985
-    if wind_mph > 5: mult *= (1.0 - min(0.15, 0.01*(wind_mph-5)))
-    mult *= {"None":1.00,"Light":0.97,"Moderate":0.93,"Heavy":0.88}.get(precip,1.0)
-    return mult
-
-def volatility_sd_dyn(off_row: pd.Series, def_row: pd.Series, min_sd: float, max_sd: float) -> float:
-    off_expl = off_row.get("offense.explosiveness__z", 0.0) or 0.0
-    def_havoc = def_row.get("defense.havoc.total__z", 0.0) or 0.0
-    sd = min_sd + 4.0*max(0.0, off_expl) - 2.0*max(0.0, def_havoc)
-    return float(np.clip(sd, min_sd, max_sd))
-
-def safe_mu_sigma(mu, sd):
-    if not np.isfinite(mu): mu = DEFAULT_BASE["BASE_TEAM_POINTS"]
-    if not (np.isfinite(sd) and sd > 0): sd = 14.0
-    return float(mu), float(sd)
-
-def simulate_scores(mu_home, mu_away, sd_home, sd_away, n_sims, seed):
-    rng = np.random.default_rng(int(seed))
-    mu_home, sd_home = safe_mu_sigma(mu_home, sd_home)
-    mu_away, sd_away = safe_mu_sigma(mu_away, sd_away)
-    home = rng.normal(mu_home, sd_home, size=n_sims)
-    away = rng.normal(mu_away, sd_away, size=n_sims)
-    home = np.clip(home, 0, None); away = np.clip(away, 0, None)
-    home = np.nan_to_num(home, nan=0.0); away = np.nan_to_num(away, nan=0.0)
-    return np.rint(home).astype(int), np.rint(away).astype(int)
-
-def cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, spread_odds, total_odds):
-    margin = home_scores - away_scores
-    total = home_scores + away_scores
-    k = market_spread_home
-    k_is_int = abs(k - round(k)) < 1e-9
-    if k_is_int:
-        p_home_push = float(np.mean(margin == int(round(k))))
-        p_home_cover = float(np.mean(margin > k))
-        p_home_lose = max(0.0, 1.0 - p_home_cover - p_home_push)
-    else:
-        p_home_push = 0.0; p_home_cover = float(np.mean(margin > k)); p_home_lose = 1.0 - p_home_cover
-    t = market_total
-    t_is_int = abs(t - round(t)) < 1e-9
-    if t_is_int:
-        p_over_push = float(np.mean(total == int(round(t))))
-        p_over = float(np.mean(total > t))
-        p_under = max(0.0, 1.0 - p_over - p_over_push)
-    else:
-        p_over_push = 0.0; p_over = float(np.mean(total > t)); p_under = 1.0 - p_over
-    return {
-        "p_home_cover": p_home_cover, "p_home_push": p_home_push, "p_away_cover": p_home_lose,
-        "ev_home_spread": ev_from_p(p_home_cover, spread_odds, p_home_push),
-        "ev_away_spread": ev_from_p(p_home_lose,  spread_odds, p_home_push),
-        "p_over": p_over, "p_over_push": p_over_push, "p_under": p_under,
-        "ev_over": ev_from_p(p_over,  total_odds, p_over_push),
-        "ev_under": ev_from_p(p_under, total_odds, p_over_push),
-        "home_win": float(np.mean(margin > 0.0) + 0.5*np.mean(margin == 0.0)),
-        "away_win": float(np.mean(margin < 0.0) + 0.5*np.mean(margin == 0.0)),
-    }
-
-def choose_recommendation(metrics, market_spread_home, market_total):
-    candidates = [
-        ("Home " + (f"{market_spread_home:+g}" if market_spread_home != 0 else "PK"),
-         metrics["ev_home_spread"], metrics["p_home_cover"]),
-        ("Away " + (f"{-market_spread_home:+g}" if market_spread_home != 0 else "PK"),
-         metrics["ev_away_spread"], metrics["p_away_cover"]),
-        (f"Over {market_total:g}", metrics["ev_over"], metrics["p_over"]),
-        (f"Under {market_total:g}", metrics["ev_under"], metrics["p_under"]),
-    ]
-    label, ev, p = max(candidates, key=lambda x: x[1])
-    return {"label": label, "ev": ev, "p": p, "confidence": bucket_confidence(ev, p)}
-
-# =============================== Page & Styles ===============================
-st.set_page_config(page_title="CFB Predictor — PPA Monte Carlo", layout="wide")
-st.markdown("""
-<style>
-.sticky-wrap { position: sticky; top: 0; z-index: 999; background: var(--background-color);
-  padding: .5rem 0; border-bottom: 1px solid rgba(255,255,255,.08); }
-.summary-card { border-radius: 14px; padding: 14px 18px; margin: 10px 0 18px 0;
-  background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
-  border: 1px solid rgba(255,255,255,.12); }
-.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-.summary-item { padding: 6px 10px; border-radius: 10px; background: rgba(255,255,255,.05); }
-.summary-item .label { font-size: .8rem; opacity: .75; } .summary-item .value { font-weight: 700; font-size: 1.15rem; }
-.winner { font-weight: 800; font-size: 1.25rem; }
-.bet-col h4 { margin-top: .25rem; }
-.bet-card, .proj-card { border: 1px solid rgba(255,255,255,.12); border-radius: 12px;
-  padding: 10px 12px; margin-bottom: 8px; background: rgba(255,255,255,.04); }
-.proj-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
-.bet-pick { font-size: 1.05rem; font-weight: 700; }
-.pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.75rem; font-weight:700; margin-left: 6px;}
-.pill.pending{ background:rgba(255,255,255,.12); }
-.pill.win{ background:rgba(0,200,0,.15); color:#9CFF9C;}
-.pill.loss{ background:rgba(255,0,0,.18); color:#FF9D9D;}
-.pill.push{ background:rgba(255,210,0,.18); color:#FFE38A;}
-details > summary { font-size: 0.85rem; opacity: .8; }
-.edit-row .stSelectbox, .edit-row .stButton { min-width: 140px; } .edit-row .stButton > button { width: 140px; }
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🏈 CFB Predictor — PPA Monte Carlo, Market Blend & EV")
-
-# =============================== Sidebar / data load ===============================
-with st.sidebar:
-    st.header("Data & Settings")
-    uploaded = st.file_uploader("Upload PPA CSV", type=["csv"])
-    df = load_csv(uploaded)
-    if df.empty: st.info("Upload a CSV (or keep `advancedStats.csv` next to this app).")
-    else: st.success(f"Loaded {len(df)} rows.")
-    if st.button("Forget uploaded CSV"):
-        st.session_state.pop("csv_bytes", None); st.rerun()
-    st.write("---")
-    st.session_state["room"] = st.text_input("Room (namespace)", value=st.secrets.get("ROOM", "main"))
-    st.caption(f"Persistence: **{persistence_mode()}** (room: `{_room()}`)")
-
-# Always load settings so Tuning works without data
-BASE, OFF_WEIGHTS, DEF_WEIGHTS = load_settings()
-
-# Determine whether we have valid data for simulations
-has_data = False
-if df.empty:
-    st.info("No CSV loaded — logging-only mode. You can still use **Bet Logger** and view **Saved Projections**.")
-else:
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        st.warning(f"CSV missing required columns: {missing}. Logging-only mode enabled.")
-    else:
-        df = coerce_and_impute(df)
-
-        # Ratings mode if new columns exist
-        HAS_RATINGS = all(c in df.columns for c in ["off_rating", "def_rating"])
-
-        # Build z-scores for legacy component model & tuning UI
-        zcols = list(set(list(OFF_WEIGHTS.keys()) + list(DEF_WEIGHTS.keys())))
-        df_z = zscore_columns(df, zcols)
-
-        # Also carry over ratings/vol columns (as-is) so we can read them from the same df_z
-        for c in OPTIONAL_NEW_COLS:
-            if c in df.columns and c not in df_z.columns:
-                df_z[c] = df[c]
-
-        team_list = sorted(df_z["team"].unique().tolist())
-        has_data = True
-
-# =============================== Sticky matchup ===============================
-if has_data:
-    st.markdown('<div class="sticky-wrap">', unsafe_allow_html=True)
-    t1, t2, t3 = st.columns([1.2, 1.2, 0.6])
-    with t1: home = st.selectbox("Home team", team_list, index=0, key="home_team_top")
-    with t2: away = st.selectbox("Away team", team_list, index=1 if len(team_list) > 1 else 0, key="away_team_top")
-    with t3:
-        cA, cB = st.columns(2)
-        with cB: neutral = st.toggle("Neutral", value=False)
-    st.markdown('</div>', unsafe_allow_html=True)
-    if home == away:
-        st.warning("Pick two different teams.")
-        st.stop()
-else:
-    st.info("Logging-only mode: upload a CSV to unlock matchup sims & projections. Bet Logger works below.")
-
-# =============================== Tabs ===============================
-tabs = st.tabs(["Adjustments", "Tuning", "Bet Logger", "Saved Projections"])
-
-# ---------- Adjustments ----------
-with tabs[0]:
-    if not has_data:
-        st.info("Upload a CSV to run simulations. Bet Logger is available without data.")
-    else:
-        left, right = st.columns([1, 1], gap="large")
-        with left:
-            st.subheader("Weather & Context")
-            indoor = st.checkbox("Indoors / Roof Closed", value=False)
-            temp_f = st.slider("Temperature (°F)", -10, 110, 65, 1, disabled=indoor)
-            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, disabled=indoor)
-            precip = st.select_slider("Precipitation", ["None","Light","Moderate","Heavy"], value="None", disabled=indoor)
-            hfa = 0.0 if neutral else st.slider("Home Field Advantage (pts)", 0.0, 6.0, 2.5, 0.5)
-
-            # Show CSV league HFA as a reference if present
-            if "hfa_pts" in df_z.columns:
-                try:
-                    hfa_ref = float(pd.to_numeric(df_z["hfa_pts"], errors="coerce").dropna().median())
-                    st.caption(f"CSV league HFA reference: {hfa_ref:.2f} pts")
-                except Exception:
-                    pass
-
-        with right:
-            st.subheader("Market & Simulation")
-            st.caption("Spread inputs are **home-based** (negative = home favored).")
-            market_spread_home = st.number_input("Market Spread (Home perspective)", value=-3.0, step=0.5, format="%.1f")
-            market_total = st.number_input("Market Total", value=52.5, step=0.5, format="%.1f")
-            spread_odds = st.number_input("Spread Price (American)", value=-110, step=5)
-            total_odds = st.number_input("Total Price (American)", value=-110, step=5)
-            market_weight = st.slider("Market Blend Weight (0 model → 1 market)", 0.0, 1.0, 0.5, 0.05)
-            n_sims = st.slider("Number of Simulations", 1000, 50000, 10000, 1000)
-            seed = st.number_input("Random Seed", value=42, step=1)
-
-# ---------- Tuning ----------
-with tabs[1]:
-    st.subheader("Model Tuning")
-    t_left, t_right = st.columns([1, 1], gap="large")
-
-    with t_left:
-        st.markdown("##### Base Parameters")
-        base_edit = {}
-        base_edit["BASE_TEAM_POINTS"] = st.number_input("Baseline team points", value=float(DEFAULT_BASE["BASE_TEAM_POINTS"]), step=0.5)
-        base_edit["RATING_SCALE_TO_POINTS"] = st.number_input("Scale: z/rating diff → points", value=float(DEFAULT_BASE["RATING_SCALE_TO_POINTS"]), step=0.25)
-        base_edit["MIN_SD_POINTS"] = st.number_input("Min SD (points)", value=float(DEFAULT_BASE["MIN_SD_POINTS"]), step=0.5)
-        base_edit["MAX_SD_POINTS"] = st.number_input("Max SD (points)", value=float(DEFAULT_BASE["MAX_SD_POINTS"]), step=0.5)
-
-    def _weights_editor(title: str, weights: Dict) -> Dict:
-        st.markdown(f"##### {title}")
-        dfw = pd.DataFrame({"metric": list(weights.keys()), "weight": [float(v) for v in weights.values()]})
-        edited = st.data_editor(dfw, hide_index=True, width="stretch")
-        out = {}
-        for _, r in edited.iterrows():
-            try:
-                out[str(r["metric"])] = float(r["weight"])
-            except Exception:
-                out[str(r["metric"])] = 0.0
-        colA, colB, _ = st.columns(3)
-        with colA:
-            if st.button(f"Normalize {title.split()[0]} weights"):
-                s = sum(abs(v) for v in out.values()) or 1.0
-                for k in out: out[k] = out[k]/s
-                st.session_state[f"norm_{title}"] = out; st.rerun()
-        with colB:
-            if st.button(f"Reset {title.split()[0]} to defaults"):
-                return DEFAULT_OFF_WEIGHTS.copy() if "Off" in title else DEFAULT_DEF_WEIGHTS.copy()
-        if f"norm_{title}" in st.session_state:
-            out = st.session_state.pop(f"norm_{title}")
-        return out
-
-    with t_right:
-        off_new = _weights_editor("Offense Weights", DEFAULT_OFF_WEIGHTS)
-        def_new = _weights_editor("Defense Weights", DEFAULT_DEF_WEIGHTS)
-
-    st.markdown("---")
-    t1, _ = st.columns([1,3])
-    with t1:
-        if st.button("💾 Save Tuning"):
-            ok = save_settings(base_edit, off_new, def_new)
-            if ok: st.success("Saved model settings."); st.rerun()
-            else: st.error("Could not save settings.")
-    st.caption("Weights used only if ratings columns are missing. Defense weights may be negative where lower is better.")
-
-# =============================== Model compute & Summary (only with data) ===============================
-if has_data:
-    home_row = team_row(df_z, home)
-    away_row = team_row(df_z, away)
-
-    # 1) Ratings vs legacy composites
-    if 'HAS_RATINGS' in locals() and HAS_RATINGS:
-        home_off = float(home_row.get("off_rating", 0.0))
-        home_def = float(home_row.get("def_rating", 0.0))
-        away_off = float(away_row.get("off_rating", 0.0))
-        away_def = float(away_row.get("def_rating", 0.0))
-        method_label = "Ratings"
-    else:
-        home_off = composite_rating(home_row, DEFAULT_OFF_WEIGHTS)
-        home_def = composite_rating(home_row, DEFAULT_DEF_WEIGHTS)
-        away_off = composite_rating(away_row, DEFAULT_OFF_WEIGHTS)
-        away_def = composite_rating(away_row, DEFAULT_DEF_WEIGHTS)
-        method_label = "Weighted components"
-
-    # 2) Baseline scoring level & HFA
-    mu_base_home = float(home_row.get("mu_pts", DEFAULT_BASE["BASE_TEAM_POINTS"]))
-    mu_base_away = float(away_row.get("mu_pts", DEFAULT_BASE["BASE_TEAM_POINTS"]))
-    mu_base = 0.5 * (mu_base_home + mu_base_away)
-    pts_per_sd = float(DEFAULT_BASE["RATING_SCALE_TO_POINTS"])
-
-    mu_home_raw = mu_base + pts_per_sd * (home_off - away_def)
-    mu_away_raw = mu_base + pts_per_sd * (away_off - home_def)
-
-    # Apply UI HFA (you can add CSV hfa_pts if desired)
-    hfa_pts_ui = 0.0 if neutral else float(hfa)
-    mu_home_raw += hfa_pts_ui / 2.0
-    mu_away_raw -= hfa_pts_ui / 2.0
-
-    # 3) Weather impact
-    w_mult = weather_multiplier(temp_f, wind_mph, precip, indoor)
-    mu_home = mu_home_raw * w_mult
-    mu_away = mu_away_raw * w_mult
-
-    # 4) Volatility from CSV or fallback
-    if "vol_points" in df_z.columns:
-        sd_home = float(np.clip(home_row.get("vol_points", DEFAULT_BASE["MIN_SD_POINTS"]),
-                                DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"]))
-        sd_away = float(np.clip(away_row.get("vol_points", DEFAULT_BASE["MIN_SD_POINTS"]),
-                                DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"]))
-    else:
-        sd_home = volatility_sd_dyn(home_row, away_row, DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"])
-        sd_away = volatility_sd_dyn(away_row, home_row, DEFAULT_BASE["MIN_SD_POINTS"], DEFAULT_BASE["MAX_SD_POINTS"])
-
-    if not indoor:
-        sd_tighten = 1.0 - (1.0 - w_mult) * 0.5
-        sd_home *= sd_tighten
-        sd_away *= sd_tighten
-
-    # 5) Simulate
-    home_scores, away_scores = simulate_scores(mu_home, mu_away, sd_home, sd_away, int(n_sims), int(seed))
-    margins = home_scores - away_scores; totals = home_scores + away_scores
-
-    # Model lines (betting style per team)
-    model_spread = float(np.mean(margins))   # + => home ahead
-    model_total  = float(np.mean(totals))
-    model_home_line = -model_spread
-    model_away_line = +model_spread
-
-    # Blended lines
-    blend_spread = (1 - market_weight) * model_spread + market_weight * market_spread_home
-    blend_total  = (1 - market_weight) * model_total  + market_weight * market_total
-    blend_home_line = -blend_spread
-    blend_away_line = +blend_spread
-
-    metrics = cover_probs_and_ev(home_scores, away_scores, market_spread_home, market_total, int(spread_odds), int(total_odds))
-    recommendation = choose_recommendation(metrics, market_spread_home, market_total)
-    proj_home = float(np.mean(home_scores)); proj_away = float(np.mean(away_scores))
-    winner = home if proj_home > proj_away else away
-
-    # ----- Summary Card -----
-    st.markdown('<div class="summary-card">', unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="summary-grid">
-      <div class="summary-item"><div class="label">Projected Score</div>
-        <div class="value">{home}: {proj_home:.1f}</div></div>
-      <div class="summary-item"><div class="label">&nbsp;</div>
-        <div class="value">{away}: {proj_away:.1f}</div></div>
-      <div class="summary-item"><div class="label">Projected Winner</div>
-        <div class="value winner">{winner}</div></div>
-      <div class="summary-item"><div class="label">Blended Spread</div>
-        <div class="value">{home}: {blend_home_line:+.2f} &nbsp;/&nbsp; {away}: {blend_away_line:+.2f}</div></div>
-      <div class="summary-item"><div class="label">Blended Total</div>
-        <div class="value">{blend_total:.2f}</div></div>
-      <div class="summary-item"><div class="label">Recommendation</div>
-        <div class="value">{recommendation['confidence']} — {recommendation['label']}</div></div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ----- Quick metrics -----
-    c1, c2, c3 = st.columns([1,1,1])
-    with c1:
-        st.subheader("Projected Score (Raw Model)")
-        st.metric(home, f"{proj_home:.1f}"); st.metric(away, f"{proj_away:.1f}")
-        st.caption(f"Median: {home} {np.median(home_scores):.0f} — {away} {np.median(away_scores):.0f}")
-    with c2:
-        st.subheader("Model Lines")
-        st.metric(f"{home} spread", f"{model_home_line:+.2f}")
-        st.metric(f"{away} spread", f"{model_away_line:+.2f}")
-        st.caption(f"Betting-style (negative = favorite). Method: {method_label}.")
-    with c3:
-        st.subheader("Market-Blended Lines")
-        st.metric(f"{home} spread", f"{blend_home_line:+.2f}")
-        st.metric(f"{away} spread", f"{blend_away_line:+.2f}")
-        st.caption(f"Blend: {100*(1-market_weight):.0f}% model / {100*market_weight:.0f}% market")
+    st.markdown("#### Weather (ignored if indoors/roof closed)")
+    w1, w2, w3 = st.columns(3)
+    with w1:
+        temp_f = st.slider("Temperature (°F)", 10, 100, 70, 1,
+            help="Cold (<40°F) or hot (>85°F) slightly reduces expected scoring.")
+    with w2:
+        wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1,
+            help="Above ~10 mph, wind trims passing/kicking efficiency and lowers totals.")
+    with w3:
+        precip = st.select_slider("Precipitation", options=["None","Light","Moderate","Heavy"], value="None",
+            help="Rain/snow reduces totals; heavier precip lowers more.")
 
     st.divider()
-    a,b,c,d,e = st.columns(5)
-    with a: st.metric(f"Home {market_spread_home:+g}", f"{metrics['p_home_cover']*100:.1f}%"); st.caption(f"EV @ {spread_odds}: {metrics['ev_home_spread']:.3f}/1u")
-    with b: st.metric(f"Away {-market_spread_home:+g}", f"{metrics['p_away_cover']*100:.1f}%"); st.caption(f"EV @ {spread_odds}: {metrics['ev_away_spread']:.3f}/1u")
-    with c: st.metric(f"Over {market_total:g}", f"{metrics['p_over']*100:.1f}%"); st.caption(f"EV @ {total_odds}: {metrics['ev_over']:.3f}/1u")
-    with d: st.metric(f"Under {market_total:g}", f"{metrics['p_under']*100:.1f}%"); st.caption(f"EV @ {total_odds}: {metrics['ev_under']:.3f}/1u")
-    with e: st.metric("Win Prob (Model)", f"{metrics['home_win']*100:.1f}% {home}"); st.caption(f"{away}: {metrics['away_win']*100:.1f}%")
+    st.subheader("Market Lines (for comparison / blending)")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        market_spread_home = st.number_input("Market Spread (home line)", value=-3.5, step=0.5,
+            help="Sportsbook home line (negative means home favorite).")
+    with m2:
+        market_total = st.number_input("Market Total", value=54.5, step=0.5,
+            help="Sportsbook total points line.")
+    with m3:
+        spread_price = st.number_input("Spread Price (American)", value=-110, step=5,
+            help="Price for the spread (e.g., -110). Used for EV calc.")
+    with m4:
+        total_price = st.number_input("Total Price (American)", value=-110, step=5,
+            help="Price for Over/Under (e.g., -110). Used for EV calc.")
 
-    st.subheader("Recommendation")
-    st.write(f"**{recommendation['confidence']}** — {recommendation['label']} (EV {recommendation['ev']:.3f}/1u, P {recommendation['p']*100:.1f}%).")
+    st.markdown("#### Blending")
+    blend_weight = st.slider("Market Blend Weight (w)", 0.0, 1.0, 0.35, 0.05,
+        help="0 = pure model; 1 = pure market. Blends lines/total for a sanity-checked number.")
 
-# =============================== Bet Logger =========================== #
-def _profit_units(row) -> float:
-    stake = float(row.get("stake") or 1.0)
-    odds = row.get("odds")
-    try:
-        odds = int(odds) if pd.notna(odds) else -110
-    except Exception:
-        odds = -110
-    per_unit = american_odds_profit_per_unit(odds)
-    res = (str(row.get("result") or "pending")).lower()
-    if res == "win":  return stake * per_unit
-    if res == "loss": return -stake
-    return 0.0
+    # ----- Grounding (optional) + side snapshot -----
+    st.divider()
+    st.subheader("Grounding (optional)")
+    gleft, gright = st.columns([2, 1])
 
-def bettor_summary(df: pd.DataFrame, bettor: str):
-    if df is None or df.empty or "bettor" not in df.columns:
-        return 0, 0, 0, 0.0
-    if "result" not in df.columns:
-        df = df.copy(); df["result"] = "pending"
-    d = df[(df["bettor"] == bettor) & (~df["result"].eq("deleted"))].copy()
-    w = int((d["result"] == "win").sum())
-    l = int((d["result"] == "loss").sum())
-    p = int((d["result"] == "push").sum())
-    vals = pd.to_numeric(d.apply(_profit_units, axis=1), errors="coerce")
-    units = float(np.nansum(vals.to_numpy()))
-    return w, l, p, units
+    with gleft:
+        has_SOS = "SOS" in df.columns
+        has_SOR = "SOR" in df.columns
+        has_GC  = "GC"  in df.columns
 
-with tabs[2]:
-    top_cols = st.columns([1, 6])
-    with top_cols[0]:
-        if st.button("🔄 Refresh board"):
-            st.rerun()
-
-    st.markdown("### Bet Board")
-    bet_df = load_table("bet_logs")
-
-    # Board names (from secrets or fallback)
-    default_bettors: List[str] = st.secrets.get("BETTORS", [])
-    if not default_bettors and "bettor" in bet_df.columns and not bet_df.empty:
-        default_bettors = [b for b in bet_df["bettor"].dropna().unique().tolist()][:3]
-    while len(default_bettors) < 3:
-        default_bettors.append(f"Bettor {len(default_bettors)+1}")
-
-    with st.expander("Board Settings", expanded=False):
-        colA, colB, colC = st.columns(3)
-        with colA: b1 = st.text_input("Column 1", value=default_bettors[0])
-        with colB: b2 = st.text_input("Column 2", value=default_bettors[1])
-        with colC: b3 = st.text_input("Column 3", value=default_bettors[2])
-        board_names = [b1 or "—", b2 or "—", b3 or "—"]
-
-    fcol1, fcol2, _ = st.columns([1,1,2])
-    with fcol1:
-        show_status = st.selectbox("Show", ["All","Pending","Settled"], index=0)
-    with fcol2:
-        max_per_col = st.slider("Max per column", 5, 40, 20, 1)
-
-    cols = st.columns(3, gap="large")
-    valid_results = ["pending","win","loss","push"]
-
-    for idx, who in enumerate(board_names):
-        with cols[idx]:
-            w_, l_, p_, u_ = bettor_summary(bet_df, who)
-            st.markdown(
-                f"<div class='bet-col'><h4>{who} — {w_}-{l_}-{p_} ({u_:+.2f}u)</h4></div>",
-                unsafe_allow_html=True,
+        # SOS
+        if not has_SOS:
+            st.info("`SOS` column not found — SOS grounding disabled.", icon="ℹ️")
+            adj_sos = False; sos_weight = 0.0; sos_sigma_pct = 0
+        else:
+            adj_sos = st.checkbox(
+                "Adjust for schedule strength (SOS rank 1=hardest)",
+                value=False,
+                help="Nudges the model margin for harder/easier schedules and can adjust spread σ."
+            )
+            sos_weight = st.slider(
+                "SOS weight (points)", 0.0, 2.0, 0.6, 0.1, disabled=not adj_sos,
+                help="Max size of the SOS-based margin correction (typical 0.3–1.0)."
+            )
+            sos_sigma_pct = st.slider(
+                "SOS → σ multiplier (±%)", 0, 40, 0, 5, disabled=not adj_sos,
+                help="Increase spread σ for easier schedules (less trust), decrease for harder."
             )
 
-            dfw = bet_df.copy()
-            if "bettor" in dfw.columns:
-                dfw = dfw[dfw["bettor"] == who]
-            else:
-                dfw = dfw.iloc[0:0]
+        # Resume: SOR & GC
+        if not (has_SOR and has_GC):
+            st.info("`SOR` and/or `GC` columns not found — resume grounding disabled.", icon="ℹ️")
+            adj_resume = False; sor_w = 0.0; gc_w = 0.0; resume_cap = 0.0; resume_sigma_pct = 0
+        else:
+            adj_resume = st.checkbox(
+                "Adjust for resume (SOR & GC ranks 1=best)",
+                value=False,
+                help="Tiny, capped margin nudge for better/worse results/control; optional σ scaling."
+            )
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                sor_w = st.slider("SOR weight (pts)", 0.0, 1.0, 0.4, 0.1, disabled=not adj_resume,
+                                  help="How much better SOR rank nudges the margin (keep small).")
+            with c2:
+                gc_w  = st.slider("GC weight (pts)", 0.0, 1.0, 0.3, 0.1, disabled=not adj_resume,
+                                  help="How much better GC rank nudges the margin (keep small).")
+            with c3:
+                resume_cap = st.slider("Resume nudge cap (±pts)", 0.0, 1.5, 1.0, 0.1, disabled=not adj_resume,
+                                       help="Caps the combined SOR+GC margin adjustment.")
+            with c4:
+                resume_sigma_pct = st.slider("Resume → σ multiplier (±%)", 0, 30, 0, 5, disabled=not adj_resume,
+                                             help="Decrease σ if average resume/control is strong; increase if weak.")
 
-            if "result" in dfw.columns:
-                dfw = dfw[~dfw["result"].eq("deleted")]
-            if show_status == "Pending" and "result" in dfw.columns:
-                dfw = dfw[dfw["result"] == "pending"]
-            elif show_status == "Settled" and "result" in dfw.columns:
-                dfw = dfw[dfw["result"].isin(["win","loss","push"])]
+    with gright:
+        st.markdown("**Current matchup — resume snapshot**")
+        def _rank_center_pair(row, colname):
+            if colname not in df.columns:
+                return "—"
+            r = get_numeric(row, colname)
+            if np.isnan(r) or r <= 0:
+                return "—"
+            c = centered_from_rank(r, n_teams)
+            return f"{int(r)} • {c:+.2f}"
 
-            dfw = dfw.head(max_per_col)
+        def _value_delta_pair(row, colname, mean, fmt="{:.2f}"):
+            if colname not in df.columns:
+                return "—"
+            v = get_numeric(row, colname)
+            if np.isnan(v):
+                return "—"
+            d = v - mean
+            return f"{fmt.format(v)} • {d:+.2f}"
 
-            if dfw.empty:
-                st.caption("No bets yet.")
-            else:
-                for _, r in dfw.iterrows():
-                    odds_txt = f"{int(r['odds']):+d}" if pd.notna(r.get("odds")) else "—"
-                    pill = r.get("result", "pending")
-                    pill = pill if pill in valid_results else "pending"
+        data_rows = []
+        # Ranks
+        data_rows.append({"Metric": "SOS (rank)", home_team: _rank_center_pair(home_row, "SOS"),
+                          away_team: _rank_center_pair(away_row, "SOS")})
+        data_rows.append({"Metric": "SOR (rank)", home_team: _rank_center_pair(home_row, "SOR"),
+                          away_team: _rank_center_pair(away_row, "SOR")})
+        data_rows.append({"Metric": "GC (rank)",  home_team: _rank_center_pair(home_row, "GC"),
+                          away_team: _rank_center_pair(away_row, "GC")})
+        # Values (value • delta vs league mean)
+        data_rows.append({"Metric": "FPI",       home_team: _value_delta_pair(home_row, "FPI", fpi_mean),
+                          away_team: _value_delta_pair(away_row, "FPI", fpi_mean)})
+        data_rows.append({"Metric": "OVRL_EFF",  home_team: _value_delta_pair(home_row, "OVRL_EFF", ovrl_mean),
+                          away_team: _value_delta_pair(away_row, "OVRL_EFF", ovrl_mean)})
+        data_rows.append({"Metric": "OFF_EFF",   home_team: _value_delta_pair(home_row, "OFF_EFF", off_mean),
+                          away_team: _value_delta_pair(away_row, "OFF_EFF", off_mean)})
+        data_rows.append({"Metric": "DEF_EFF",   home_team: _value_delta_pair(home_row, "DEF_EFF", def_mean),
+                          away_team: _value_delta_pair(away_row, "DEF_EFF", def_mean)})
+        snap_df = pd.DataFrame(data_rows).set_index("Metric")
+        st.table(snap_df)
+        st.caption("For ranks: **rank • centered** where centered ∈ [-0.50, +0.50] (higher = harder/better). "
+                   "For values: **value • Δ**, where Δ is the difference vs league average.")
 
-                    desc_text = r.get("description")
-                    note_html = ""
-                    if isinstance(desc_text, str) and desc_text.strip():
-                        note_html = f"<div class='bet-note'>{desc_text}</div>"
+with tab_bets:
+    st.subheader("Bet Board")
+    bc = st.container(border=True)
+    with bc:
+        left, right = st.columns([1,1])
+        with left:
+            show_filter = st.selectbox("Board Settings — Show", ["All", "Pending only", "Wins only", "Losses only"])
+        with right:
+            if st.button("🔄 Refresh board"): st.rerun()
 
-                    card_html = (
-                        "<div class='bet-card'>"
-                        f"<div class='bet-pick'>{r.get('pick', '')}</div>"
-                        f"<div class='bet-type'>{r.get('bet_type', '')} "
-                        f"<span class='pill {pill}'>{pill.title()}</span></div>"
-                        f"<div class='bet-odds'>Odds: {odds_txt} • {r.get('timestamp', '')}</div>"
-                        f"{note_html}"
-                        "</div>"
-                    )
-                    st.markdown(card_html, unsafe_allow_html=True)
-
-                    with st.expander("Edit", expanded=False):
-                        with st.container():
-                            edit_cols = st.columns([4, 3, 2, 0.2], gap="small")
-                            new_res = edit_cols[0].selectbox(
-                                "Result", valid_results,
-                                index=valid_results.index(pill),
-                                label_visibility="collapsed",
-                                key=f"res_{int(r.get('id', 0))}"
-                            )
-                            rid = int(r.get("id", 0))
-                            if edit_cols[1].button("Save", key=f"save_{rid}"):
-                                if rid and update_row("bet_logs", rid, {"result": new_res}):
-                                    st.success("Updated."); st.rerun()
-                            if edit_cols[2].button("Delete", key=f"del_{rid}"):
-                                if rid and delete_row("bet_logs", rid):
-                                    st.success("Deleted."); st.rerun()
-
-    st.markdown("---")
+    bettor_names = ["Zak", "Tyler", "John"]
     st.markdown("### Log a Bet")
-
-    with st.form("bet_form"):
-        bettor = st.selectbox("Bettor", board_names, index=0)
-        sportsbook = st.text_input("Sportsbook", value="—")
-        bet_type = st.selectbox("Bet Type", ["Spread","Total","Moneyline"], index=0)
-
-        if has_data:
-            home_name, away_name = home, away
-        else:
-            c1, c2 = st.columns(2)
-            with c1: home_name = st.text_input("Home team", "")
-            with c2: away_name = st.text_input("Away team", "")
-            if not (home_name and away_name):
-                st.caption("Enter both team names to include them in the pick/Discord message.")
-
-        if bet_type == "Spread":
-            side = st.selectbox("Side", [f"Home ({home_name or 'Home'})", f"Away ({away_name or 'Away'})"])
-            line = st.number_input("Line (home-based; -3.5 = Home -3.5)", value=0.0, step=0.5, format="%.1f")
-            odds_str = st.text_input("Price (American, optional)", value="")
-            pick = f"{side} {line:+g}"
-        elif bet_type == "Total":
-            ou = st.selectbox("Over / Under", ["Over","Under"])
-            line = st.number_input("Total", value=50.0, step=0.5, format="%.1f")
-            odds_str = st.text_input("Price (American, optional)", value="")
-            pick = f"{ou} {line:g}"
-        else:
-            side = st.selectbox("Side", [f"Home ({home_name or 'Home'})", f"Away ({away_name or 'Away'})"])
-            odds_str = st.text_input("Price (American, optional)", value="")
-            pick = f"{side} ML {odds_str or ''}".strip()
-
-        try:
-            odds_val = int(odds_str) if odds_str.strip() else None
-        except ValueError:
-            odds_val = None
-
-        stake = st.number_input("Stake (units or dollars)", value=1.0, step=0.5, min_value=0.0)
-        description = st.text_area("Description / Note (optional)", height=60)
-        notify = st.checkbox("Notify Discord", value=True)
-        submit = st.form_submit_button("Save Bet")
-
-    if submit:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        ms = round(model_spread, 2) if has_data else None
-        mt = round(model_total, 2) if has_data else None
-        bs = round(blend_spread, 2) if has_data else None
-        bt = round(blend_total, 2) if has_data else None
-        rec_txt = (f"{recommendation['confidence']} — {recommendation['label']}") if has_data else ""
-        ev_best = round(recommendation["ev"], 3) if has_data else None
-
-        row = {
-            "timestamp": ts,
-            "bettor": bettor,
-            "home": home_name or "",
-            "away": away_name or "",
-            "bet_type": bet_type,
-            "pick": pick,
-            "odds": odds_val,
-            "stake": float(stake),
-            "model_spread": ms,
-            "model_total": mt,
-            "blended_spread": bs,
-            "blended_total": bt,
-            "recommendation": rec_txt,
-            "ev_best": ev_best,
-            "description": description,
-            "result": "pending",
-            "room": _room(),
-        }
-        if persist_row(row, "bet_logs"):
-            st.success("Bet saved.")
-
-        if notify:
-            odds_txt = f"{int(odds_val):+d}" if odds_val is not None else "—"
-            sep = "────────────────────────────────"
-            note_line = f"Note: {description}\n" if (description and str(description).strip()) else ""
-
-            lines = [
-                sep,
-                f"🚨 **{bettor}'s New Bet** 🚨",
-                f"Game: {home_name or 'Home'} vs {away_name or 'Away'}",
-                "",
-                f"{bet_type}: {pick} @ {odds_txt}",
-                f"Stake: {stake}u",
-            ]
-            if has_data:
-                lines += [
-                    "",
-                    f"Blend: {home}: {(-blend_spread):+.2f} / {away}: {(+blend_spread):+.2f} (total {blend_total:.2f})",
-                    f"Reco: {recommendation['confidence']} — {recommendation['label']}",
-                ]
-            if note_line:
-                lines += ["", note_line.strip()]
-            lines.append(sep)
-
-            ok, detail = notify_discord("\n".join(lines))
-            st.info(f"Discord: {'sent' if ok else 'not sent'} ({detail})")
-
-        st.rerun()
-
-# =============================== Saved Projections (no loading) ===============================
-with tabs[3]:
-    st.markdown("### Save / Manage Projections")
-
-    if has_data:
-        if st.button("💾 Save Current Projection Summary"):
-            ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            row = {
-                "timestamp": ts, "home": home, "away": away, "room": _room(),
-                "proj_home": round(proj_home, 1), "proj_away": round(proj_away, 1),
-                "model_spread": round(model_spread, 2), "model_total": round(model_total, 2),
-                "blended_spread": round(blend_spread, 2), "blended_total": round(blend_total, 2),
-                "winner": winner, "recommendation": f"{recommendation['confidence']} — {recommendation['label']}",
-                "ev_best": round(recommendation["ev"], 3),
-                "weather_mult": round(weather_multiplier(temp_f, wind_mph, precip, indoor), 3),
-                "hfa_points": float(0.0 if neutral else hfa), "n_sims": int(n_sims), "seed": int(seed),
-                # extra saved context
-                "market_spread_home": float(market_spread_home),
-                "market_total": float(market_total),
-                "market_weight": float(market_weight),
-                "spread_odds": int(spread_odds),
-                "total_odds": int(total_odds),
-                "temp_f": float(temp_f),
-                "wind_mph": float(wind_mph),
-                "precip": precip,
-                "indoor": bool(indoor),
-                "neutral": bool(neutral),
+    with st.form("bet_form_v2", clear_on_submit=True):
+        l1, l2, l3 = st.columns(3)
+        with l1:
+            bettor = st.selectbox("Bettor", bettor_names, key="bettor_sel")
+            sportsbook = st.text_input("Sportsbook", placeholder="(optional)")
+            bet_type = st.selectbox("Bet Type", ["Spread", "Total", "Moneyline"])
+        with l2:
+            side = st.selectbox("Side", [f"Home ({home_team})", f"Away ({away_team})"]) if bet_type != "Total" else st.selectbox("O/U", ["Over", "Under"])
+            if bet_type == "Spread":
+                home_based_line = st.number_input("Line (home-based; -3.5 = Home -3.5)", value=-3.5, step=0.5)
+            elif bet_type == "Total":
+                total_line = st.number_input("Total (pts)", value=float(54.5), step=0.5)
+            else:
+                home_based_line = 0.0
+        with l3:
+            price = st.number_input("Price (American, optional)", value=-110, step=5)
+            stake = st.number_input("Stake (units or dollars)", value=1.0, min_value=0.0, step=0.5)
+            notify_discord = st.checkbox("🔔 Notify Discord", value=False)
+        note = st.text_area("Description / Note (optional)", "")
+        submitted = st.form_submit_button("Save Bet")
+        if submitted:
+            record = {
+                "bettor": bettor,
+                "book": sportsbook,
+                "type": bet_type,
+                "side": ("Home" if bet_type != "Total" and side.startswith("Home") else ("Away" if bet_type != "Total" else None)),
+                "ou": (side if bet_type == "Total" else None),
+                "home_based_line": (float(home_based_line) if bet_type == "Spread" else None),
+                "total_line": (float(total_line) if bet_type == "Total" else None),
+                "price": float(price),
+                "stake": float(stake),
+                "status": "pending",
+                "note": note,
+                "notify_discord": bool(notify_discord),
+                "home_team": home_team,
+                "away_team": away_team,
             }
-            if persist_row(row, "saved_projections"):
-                st.success("Projection saved.")
+            row = db_add_bet(record)
+            if notify_discord:
+                send_discord_bet(row or record)
+            st.success("Bet saved.")
             st.rerun()
+
+    # Board columns
+    def _pass_filter(b):
+        if show_filter == "All": return True
+        if show_filter == "Pending only": return b.get("status") == "pending"
+        if show_filter == "Wins only": return b.get("status") == "win"
+        if show_filter == "Losses only": return b.get("status") == "loss"
+        return True
+
+    bets = db_list_bets()
+    c_zak, c_ty, c_john = st.columns(3)
+    cols_map = {"Zak": c_zak, "Tyler": c_ty, "John": c_john}
+    totals = {name: {"win":0,"loss":0,"push":0} for name in cols_map}
+    for b in bets:
+        name = b.get("bettor","")
+        if name in totals and b.get("status") in totals[name]:
+            totals[name][b.get("status")] += 1
+
+    for name, col in cols_map.items():
+        with col:
+            t = totals[name]
+            st.subheader(f"{name} — {t['win']}-{t['loss']}-{t['push']}")
+            shown_any = False
+            for i, b in enumerate(bets):
+                if b.get("bettor") != name or not _pass_filter(b): 
+                    continue
+                shown_any = True
+                with st.container(border=True):
+                    sel_txt = ""
+                    if b.get("type") == "Total":
+                        sel_txt = f"{b.get('ou')} {b.get('total_line'):.1f}"
+                    elif b.get("type") == "Spread":
+                        who = home_team if b.get("side") == "Home" else away_team
+                        line = b.get("home_based_line")
+                        if line is not None and line > 0: line = f"+{line}"
+                        sel_txt = f"{b.get('side')} ({who}) {line}"
+                    else:
+                        who = home_team if b.get("side") == "Home" else away_team
+                        sel_txt = f"{b.get('side')} ({who}) ML"
+
+                    created = b.get("created_at","")
+                    st.markdown(f"**{sel_txt}**")
+                    st.markdown(
+                        f"<span class='muted'>{ b.get('type') }</span> {status_badge_html(b.get('status','pending'))}",
+                        unsafe_allow_html=True,
+                    )
+                    st.write(f"Odds: {int(b.get('price',0))} • {created}")
+                    if b.get("note"): st.write(b["note"])
+                    if b.get("book"): st.caption(f"Book: {b['book']}")
+
+                    with st.expander("Edit"):
+                        new_status = st.selectbox("Status", ["pending","win","loss","push"],
+                                                  index=["pending","win","loss","push"].index(b.get("status","pending")),
+                                                  key=f"stat_{name}_{i}")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("Save", key=f"save_{name}_{i}"):
+                                db_update_bet_status(b.get("id", ""), new_status)
+                                st.success("Status updated."); st.rerun()
+                        with c2:
+                            if st.button("Delete", key=f"del_{name}_{i}"):
+                                db_delete_bet(b.get("id","")); st.rerun()
+            if not shown_any: st.caption("No bets yet.")
+
+with tab_saved:
+    st.subheader("Saved Projections")
+    st.caption("Backed by Supabase (falls back to local if not configured).")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("💾 Save current projection"):
+            db_add_projection(st.session_state.get("latest_projection", {}))
+            st.success("Projection saved."); st.rerun()
+    with c2:
+        if st.button("🧹 Clear all saved"):
+            if USE_DB:
+                # Dangerous: delete all rows
+                for p in db_list_projections():
+                    db_delete_projection(p.get("id",""))
+            else:
+                st.session_state["projections"] = []
+            st.rerun()
+
+    projs = db_list_projections()
+    if not projs:
+        st.info("No saved projections yet.")
     else:
-        st.info("Upload a CSV to save new projections. You can still view and manage previously saved items below.")
+        def _safe_float(x):
+            try: return float(x)
+            except: return np.nan
+        def _spread_str_from_points(p):
+            ht = p.get("home_team","Home"); at = p.get("away_team","Away")
+            hp = _safe_float(p.get("home_pts")); ap = _safe_float(p.get("away_pts"))
+            if not np.isnan(hp) and not np.isnan(ap):
+                s = hp - ap
+                return format_home_away_spreads(ht, at, model_spread_to_home_line(s))[0]
+            return "N/A"
+        for j, p in enumerate(projs):
+            home_team_p = p.get("home_team","Home"); away_team_p = p.get("away_team","Away")
+            tm = _safe_float(p.get("total_model")); tb = _safe_float(p.get("total_blended"))
+            model_spread_str = p.get("model_home_spread_str") or _spread_str_from_points(p)
+            blended_spread_str = p.get("blended_home_spread_str","N/A")
+            hp = _safe_float(p.get("home_pts")); ap = _safe_float(p.get("away_pts"))
+            with st.container(border=True):
+                st.write(f"**{away_team_p} @ {home_team_p}**")
+                if not np.isnan(hp) and not np.isnan(ap):
+                    st.write(f"**Model:** {home_team_p} {hp:.1f} — {away_team_p} {ap:.1f}")
+                st.write(f"Spread: {model_spread_str} | Total: {tm:.1f}" if not np.isnan(tm) else f"Spread: {model_spread_str}")
+                if not np.isnan(tb): st.write(f"**Blended:** Spread {blended_spread_str} | Total {tb:.1f}")
+                st.write(f"**Rec:** {p.get('recommendation','—')}")
+                if st.button("Delete saved", key=f"dels_{p.get('id', j)}"):
+                    db_delete_projection(p.get("id","")); st.rerun()
 
-    proj_df = load_table("saved_projections")
+with tab_snap:
+    st.subheader("Matchup Snapshot")
+    st.caption("Bars compare teams on ranks (higher = better/harder) and efficiencies (0–100 scale). Tooltip shows raw values.")
 
-    # Controls
-    f1, f2, f3 = st.columns([2,1,1])
-    with f1: filter_txt = st.text_input("Filter by team (contains)", value="")
-    with f2: max_items = st.slider("Max items", 5, 100, 24, 1)
-    with f3: sort_newest = st.toggle("Newest first", value=True)
+    def _rank_score(row, col):
+        r = get_numeric(row, col)
+        if np.isnan(r) or r <= 0: return np.nan, "—"
+        score = (n_teams + 1 - r) / n_teams * 100.0  # 1 -> 100
+        return score, f"rank {int(r)}"
+    def _eff_score(row, col):
+        v = get_numeric(row, col)
+        if np.isnan(v): return np.nan, "—"
+        return float(v), f"{v:.1f}"
+    def _fpi_score(row):
+        v = get_numeric(row, "FPI")
+        if np.isnan(v): return np.nan, "—"
+        rng = max(1e-6, float(fpi_max - fpi_min))
+        score = (float(v) - float(fpi_min)) / rng * 100.0
+        return score, f"{v:.2f}"
 
-    if not proj_df.empty:
-        # Filter & sort
-        pdf = proj_df.copy()
-        if filter_txt.strip():
-            m = pdf["home"].fillna("").str.contains(filter_txt, case=False) | pdf["away"].fillna("").str.contains(filter_txt, case=False)
-            pdf = pdf[m]
-        pdf["ts_ord"] = pd.to_datetime(pdf["timestamp"], errors="coerce")
-        pdf = pdf.sort_values("ts_ord", ascending=not sort_newest, na_position="last").drop(columns=["ts_ord"])
-        pdf = pdf.head(max_items)
+    metrics = [
+        ("Strength of Schedule (rank)", "SOS", "rank"),
+        ("Strength of Record (rank)",   "SOR", "rank"),
+        ("Game Control (rank)",         "GC",  "rank"),
+        ("Football Power Index",        "FPI", "fpi"),
+        ("Overall Efficiency",          "OVRL_EFF", "eff"),
+        ("Offensive Efficiency",        "OFF_EFF",  "eff"),
+        ("Defensive Efficiency",        "DEF_EFF",  "eff"),
+        ("Special Teams Efficiency",    "SP_EFF",   "eff"),
+    ]
 
-        # Grid cards
-        st.markdown('<div class="proj-grid">', unsafe_allow_html=True)
-        for _, r in pdf.iterrows():
-            rid = int(r.get("id", 0))
-            home_name = r.get('home','?'); away_name = r.get('away','?')
-            blended_spread_r = float(r.get('blended_spread', 0) or 0.0)
-            blended_total_r  = float(r.get('blended_total', 0) or 0.0)
+    rows = []
+    for label, col, typ in metrics:
+        if col not in df.columns: 
+            continue
+        if typ == "rank":
+            hs, hd = _rank_score(home_row, col)
+            as_, ad = _rank_score(away_row, col)
+        elif typ == "fpi":
+            hs, hd = _fpi_score(home_row)
+            as_, ad = _fpi_score(away_row)
+        else:
+            hs, hd = _eff_score(home_row, col)
+            as_, ad = _eff_score(away_row, col)
+        rows += [
+            {"MetricNice": label, "Team": home_team, "Score": hs, "Display": hd},
+            {"MetricNice": label, "Team": away_team, "Score": as_, "Display": ad},
+        ]
+    longdf = pd.DataFrame(rows).dropna()
+    order = [m[0] for m in metrics if m[1] in df.columns]
 
-            card = f"""
-            <div class="proj-card">
-              <div style="font-weight:700;font-size:1.05rem;">{home_name} vs {away_name}</div>
-              <div style="opacity:.7;font-size:.85rem;">{r.get('timestamp','')}</div>
-              <div style="margin-top:.35rem;">
-                <div><b>Projected</b> — {home_name}: {r.get('proj_home','?')}, {away_name}: {r.get('proj_away','?')}</div>
-                <div><b>Model</b> — {home_name}: {-(float(r.get('model_spread',0) or 0.0)):+.2f} / {away_name}: {(float(r.get('model_spread',0) or 0.0)):+.2f} (total {float(r.get('model_total',0) or 0.0):.2f})</div>
-                <div><b>Blended</b> — {home_name}: {(-blended_spread_r):+.2f} / {away_name}: {(+blended_spread_r):+.2f} (total {blended_total_r:.2f})</div>
-                <div><b>Winner</b> — {r.get('winner','?')}</div>
-                <div><b>Rec</b> — {r.get('recommendation','')}</div>
-              </div>
-            </div>
-            """
-            st.markdown(card, unsafe_allow_html=True)
-
-            cDel, _ = st.columns([0.2, 2.8])
-            with cDel:
-                if st.button("Delete", key=f"del_proj_{rid}"):
-                    if rid and delete_row("saved_projections", rid):
-                        st.success("Deleted."); st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # Bulk delete filtered
-        del_cols = st.columns([1,2])
-        with del_cols[0]:
-            confirm = st.checkbox("Confirm delete filtered")
-        with del_cols[1]:
-            if st.button("🗑️ Delete filtered"):
-                if confirm:
-                    ids = [int(i) for i in pdf["id"].dropna().tolist()]
-                    ok_all = True
-                    for rid in ids:
-                        if not delete_row("saved_projections", rid): ok_all = False
-                    st.success("Deleted filtered." if ok_all else "Deleted with some errors."); st.rerun()
-                else:
-                    st.warning("Check confirm to proceed.")
-
-        # Raw table + download
-        st.dataframe(pdf, width="stretch")
-        st.download_button(
-            "⬇️ Download filtered (CSV)",
-            data=pdf.to_csv(index=False).encode("utf-8"),
-            file_name="saved_projections_filtered.csv",
-            mime="text/csv",
+    if alt is not None and not longdf.empty:
+        chart = (
+            alt.Chart(longdf)
+            .mark_bar(size=22)
+            .encode(
+                y=alt.Y("MetricNice:N", sort=list(reversed(order)),
+                        axis=alt.Axis(title=None, labelLimit=260)),
+                x=alt.X("Score:Q", title="Scaled score (0–100)",
+                        scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("Team:N", legend=alt.Legend(orient="bottom")),
+                tooltip=["Team:N","MetricNice:N","Display:N"]
+            )
+            .properties(height=alt.Step(30))
         )
+        st.altair_chart(chart, use_container_width=True)
     else:
-        st.caption("No saved projections yet.")
+        if longdf.empty:
+            st.info("Snapshot unavailable for this CSV.")
+        else:
+            st.dataframe(longdf.pivot_table(index="MetricNice", columns="Team", values="Display", aggfunc="first"))
+
+with tab_guide:
+    st.subheader("Model Guide")
+    st.markdown("""
+**Acronyms**  
+- **SOS** — *Strength of Schedule* **rank** to date (1 = hardest).  
+- **SOR** — *Strength of Record* **rank** (1 = best resume vs schedule).  
+- **GC** — *Game Control* **rank** (1 = most wire-to-wire control).
+
+**What the model does**
+
+- Uses **FPI** to set a baseline **Model Margin** (Home − Away) plus optional **home field**.
+- Builds **Model Total** from offense/defense/special-teams efficiencies vs league averages, then nudges for **weather**.
+- Lets you compare & **blend** with sportsbook numbers (weight **w**).
+- Optional **grounding**: small, bounded corrections using **SOS** (schedule difficulty) and **resume** ranks (**SOR**, **GC**) to temper inflation.
+
+**How to read the snapshot numbers**
+
+- **Ranks (SOS/SOR/GC):** each cell shows `rank • centered`, where  
+  `centered = ((N + 1 − rank)/N) − 0.5` → **−0.50 to +0.50**.  
+  Positive = **harder/better**; negative = **easier/weaker**.  
+  We use these centered values for small, optional **margin nudges** and **σ scaling**.
+- **Values (FPI & efficiencies):** each cell shows `value • Δ`, where  
+  **Δ** is **value minus league average**. Positive means **above-average**.
+
+**Key outputs**
+
+- **Model Margin (favored team)** — who the model favors and by how much.  
+  **Model Home Line** is the sportsbook notation: it’s **negative** when the home team is favored (Home line = −Model margin).
+- **Model/Blended Totals**, **Rounded (median) scores**, **probabilities/EV** based on **σ (spread/total)**.
+- **σ (spread, effective)** shows the volatility **after** any SOS/SOR/GC scaling.
+
+**Adjustments (bottom-line)**
+
+- **Home Field Advantage**: adds directly to the home margin.
+- **Base Total**: starting point for totals before matchup/weather.
+- **α (OFF vs DEF)**: how much offenses vs defenses move the total.
+- **β (Special Teams)**: small nudge; keep modest.
+- **σ (spread/total)**: uncertainty knobs. Larger ⇒ probabilities closer to 50%.
+- **Neutral site / Indoors**: remove HFA / ignore weather.
+
+**Grounding (optional)**
+
+- **SOS (1 = hardest schedule to date)**  
+  • **Margin**: harder schedule gets a small bump; easier gets a small trim (via *SOS weight*).  
+  • **σ scaling**: easier schedules widen σ (less trust), harder narrow σ slightly.
+
+- **Resume: SOR & GC (1 = best)**  
+  • **Margin**: tiny, **capped** nudge using *SOR weight* and *GC weight*.  
+  • **σ scaling**: strong average resume/control → slightly smaller σ; weak → slightly larger.
+
+**When to toggle grounding**
+- Early/mid-season or when resumes/schedules differ a lot.  
+- Late season, or if you prefer the raw FPI/efficiency view, leave off.
+""")
+
+# ---------- PAGE SEPARATOR BEFORE RESULTS ----------
+st.markdown('<div class="page-sep"></div>', unsafe_allow_html=True)
+
+# ---------- Core Modeling ----------
+FPI_h = get_numeric(home_row, "FPI");  FPI_a = get_numeric(away_row, "FPI")
+OFF_h = get_numeric(home_row, "OFF_EFF"); OFF_a = get_numeric(away_row, "OFF_EFF")
+DEF_h = get_numeric(home_row, "DEF_EFF"); DEF_a = get_numeric(away_row, "DEF_EFF")
+SP_h  = get_numeric(home_row, "SP_EFF");  SP_a  = get_numeric(away_row, "SP_EFF")
+
+# Base spread (home margin)
+spread_neutral = (FPI_h - FPI_a) if (not np.isnan(FPI_h) and not np.isnan(FPI_a)) else 0.0
+spread_model = spread_neutral if neutral_site else spread_neutral + hfa_pts  # + = home better
+
+# Grounding: SOS
+has_SOS = "SOS" in df.columns
+hard_h = hard_a = 0.0
+if 'adj_sos' in locals() and adj_sos and has_SOS:
+    sos_h_rank = get_numeric(home_row, "SOS"); sos_a_rank = get_numeric(away_row, "SOS")
+    hard_h = centered_from_rank(sos_h_rank, n_teams)
+    hard_a = centered_from_rank(sos_a_rank, n_teams)
+    spread_model += sos_weight * (hard_h - hard_a)
+
+# Grounding: Resume (SOR & GC)
+has_SOR = "SOR" in df.columns
+has_GC  = "GC"  in df.columns
+sor_h = sor_a = gc_h = gc_a = 0.0
+if 'adj_resume' in locals() and adj_resume and has_SOR and has_GC:
+    sor_h_rank = get_numeric(home_row, "SOR"); sor_a_rank = get_numeric(away_row, "SOR")
+    gc_h_rank  = get_numeric(home_row, "GC");  gc_a_rank  = get_numeric(away_row, "GC")
+    sor_h = centered_from_rank(sor_h_rank, n_teams); sor_a = centered_from_rank(sor_a_rank, n_teams)
+    gc_h  = centered_from_rank(gc_h_rank, n_teams);  gc_a  = centered_from_rank(gc_a_rank, n_teams)
+    resume_nudge = sor_w * (sor_h - sor_a) + gc_w * (gc_h - gc_a)
+    resume_nudge = float(np.clip(resume_nudge, -resume_cap, resume_cap))
+    spread_model += resume_nudge
+
+# Totals
+off_term = center(OFF_h, off_mean) + center(OFF_a, off_mean)
+def_term = center(DEF_h, def_mean) + center(DEF_a, def_mean)
+sp_term  = center(SP_h,  sp_mean)  + center(SP_a,  sp_mean)
+eff_component = alpha_total * (off_term - def_term) / 2.0
+st_component  = beta_st * (sp_term) / 4.0
+
+weather_adj = 0.0
+if not indoor_roof:
+    if wind_mph > 10: weather_adj -= max(0, (wind_mph - 10)) * 0.15
+    if temp_f < 40:   weather_adj -= (40 - temp_f) * 0.05
+    if temp_f > 85:   weather_adj -= (temp_f - 85) * 0.03
+    precip_map = {"None":0.0, "Light":-0.5, "Moderate":-1.5, "Heavy":-3.0}
+    weather_adj += precip_map.get(precip, 0.0)
+
+total_model = float(np.clip(base_total + eff_component + st_component + weather_adj, 20.0, 90.0))
+
+# Team scores (model) + rounded
+home_pts_model = clamp_nonneg((total_model + spread_model) / 2.0)
+away_pts_model = clamp_nonneg(total_model - home_pts_model)
+home_pts_model_r = int(round(home_pts_model)); away_pts_model_r = int(round(away_pts_model))
+
+# Market blend
+home_line_model = _round_line(model_spread_to_home_line(spread_model))
+blend_home_line = _round_line(blend_weight * market_spread_home + (1.0 - blend_weight) * home_line_model)
+total_blended   = blend_weight * market_total + (1.0 - blend_weight) * total_model
+
+# Blended scores + rounded
+S_b = -blend_home_line
+home_pts_blend = clamp_nonneg((total_blended + S_b) / 2.0)
+away_pts_blend = clamp_nonneg(total_blended - home_pts_blend)
+home_pts_blend_r = int(round(home_pts_blend)); away_pts_blend_r = int(round(away_pts_blend))
+
+# σ scaling (effective) for spread
+sigma_scale = 1.0
+if 'adj_sos' in locals() and adj_sos and has_SOS and sos_sigma_pct:
+    sigma_scale *= 1.0 + (sos_sigma_pct/100.0) * (-(hard_h + hard_a))
+if 'adj_resume' in locals() and adj_resume and has_SOR and has_GC and resume_sigma_pct:
+    avg_resume = (sor_h + sor_a + gc_h + gc_a) / 4.0
+    sigma_scale *= 1.0 + (resume_sigma_pct/100.0) * (-(avg_resume))
+sigma_margin_eff = float(np.clip(sigma_margin * sigma_scale, 3.0, 40.0))
+
+# Probabilities / EV
+p_home_win_model   = normal_cdf(spread_model / max(1e-9, sigma_margin_eff))
+p_home_cover_model = home_cover_probability(spread_model, market_spread_home, sigma_margin_eff)
+p_over_model       = 1.0 - normal_cdf((market_total - total_model) / max(1e-9, sigma_total))
+ev_spread_model    = ev_per_unit(p_home_cover_model, spread_price)
+ev_total_over      = ev_per_unit(p_over_model, total_price)
+ev_total_under     = ev_per_unit(1.0 - p_over_model, total_price)
+
+# Recommendation
+home_spread_str, away_spread_str = format_home_away_spreads(home_team, away_team, market_spread_home)
+spread_pick = home_spread_str if ev_spread_model >= 0 else away_spread_str
+tot_pick = f"Over {market_total:.1f}" if ev_total_over >= ev_total_under else f"Under {market_total:.1f}"
+recommendation = f"{spread_pick} | {tot_pick}"
+
+# Save latest projection for quick save
+model_home_spread_str, _ = format_home_away_spreads(home_team, away_team, home_line_model)
+blended_home_spread_str, _ = format_home_away_spreads(home_team, away_team, blend_home_line)
+st.session_state.latest_projection = {
+    "home_team": home_team, "away_team": away_team,
+    "home_pts": float(home_pts_model), "away_pts": float(away_pts_model),
+    "total_model": float(total_model), "total_blended": float(total_blended),
+    "model_home_spread_str": model_home_spread_str,
+    "blended_home_spread_str": blended_home_spread_str,
+    "recommendation": recommendation,
+}
+
+# ---------- Score Cards ----------
+st.markdown("### 🧾 Score Cards")
+sc1, sc2 = st.columns(2)
+with sc1:
+    st.markdown(f"""
+<div class="score-card score-green">
+  <div class="section-caption">Model Score</div>
+  <div style="font-weight:700; font-size:1.05rem;">
+    {home_team} {home_pts_model:.1f} — {away_team} {away_pts_model:.1f}
+  </div>
+  <div class="small">Rounded (median): {home_team} <b>{home_pts_model_r}</b> — {away_team} <b>{away_pts_model_r}</b></div>
+  <div class="section-caption">Derived from model margin & total.</div>
+</div>
+""", unsafe_allow_html=True)
+with sc2:
+    st.markdown(f"""
+<div class="score-card score-yellow">
+  <div class="section-caption">Blended Score</div>
+  <div style="font-weight:700; font-size:1.05rem;">
+    {home_team} {home_pts_blend:.1f} — {away_team} {away_pts_blend:.1f}
+  </div>
+  <div class="small">Rounded (median): {home_team} <b>{home_pts_blend_r}</b> — {away_team} <b>{away_pts_blend_r}</b></div>
+  <div class="section-caption">Blend of model and market lines via weight w.</div>
+</div>
+""", unsafe_allow_html=True)
+
+mc1, mc2, mc3 = st.columns(3)
+with mc1:
+    st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Model Home Line</div>
+  <div class="value">{format_home_away_spreads(home_team, away_team, home_line_model)[0]}</div>
+</div>""", unsafe_allow_html=True)
+with mc2:
+    st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Blended Home Line</div>
+  <div class="value">{format_home_away_spreads(home_team, away_team, blend_home_line)[0]}</div>
+</div>""", unsafe_allow_html=True)
+with mc3:
+    st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Market Home Line</div>
+  <div class="value">{format_home_away_spreads(home_team, away_team, market_spread_home)[0]}</div>
+</div>""", unsafe_allow_html=True)
+
+tc1, tc2, tc3 = st.columns(3)
+with tc1:
+    st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Model Total</div>
+  <div class="value">{total_model:.1f}</div>
+</div>""", unsafe_allow_html=True)
+with tc2:
+    st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Blended Total</div>
+  <div class="value">{total_blended:.1f}</div>
+</div>""", unsafe_allow_html=True)
+with tc3:
+    st.markdown(f"""
+<div class="value-chip">
+  <div class="label">Market Total</div>
+  <div class="value">{market_total:.1f}</div>
+</div>""", unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ---------- Prediction Details ----------
+st.markdown("## 📊 Prediction Details (always shown)")
+st.write(f"**Matchup:** {away_team} @ {home_team}{' (Neutral)' if neutral_site else ''}")
+
+home_line_model_lbl, _ = format_home_away_spreads(home_team, away_team, home_line_model)
+home_line_market_lbl, _ = format_home_away_spreads(home_team, away_team, market_spread_home)
+
+if abs(spread_model) < 0.05:
+    favored_str = "Pick'em"
+else:
+    favored_team = home_team if spread_model > 0 else away_team
+    favored_str = f"{favored_team} by {abs(spread_model):.1f}"
+
+cL, cR = st.columns(2)
+with cL:
+    st.subheader("Spread & Win Prob")
+    st.markdown(
+        f"""
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="title">Model Margin (favored team)</div>
+    <div class="num">{favored_str}</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">Model Home Line (sportsbook)</div>
+    <div class="num">{home_line_model_lbl}</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">Home Win Probability (model)</div>
+    <div class="num">{100*p_home_win_model:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">P({home_line_market_lbl} covers)</div>
+    <div class="num">{100*p_home_cover_model:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">EV (spread @ {int(spread_price)})</div>
+    <div class="num">{ev_spread_model:+.2f}u</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">σ (spread, effective)</div>
+    <div class="num">{sigma_margin_eff:.1f}</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    st.caption("Positive margin favors HOME. Home line = −(Model margin). Effective σ includes any SOS/SOR/GC scaling.")
+
+with cR:
+    st.subheader("Totals")
+    st.markdown(
+        f"""
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="title">Model Total</div>
+    <div class="num">{total_model:.1f}</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">Probability Over {market_total:.1f}</div>
+    <div class="num">{100*p_over_model:.1f}%</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">EV Over (@ {int(total_price)})</div>
+    <div class="num">{ev_total_over:+.2f}u</div>
+  </div>
+  <div class="stat-card">
+    <div class="title">EV Under (@ {int(total_price)})</div>
+    <div class="num">{ev_total_under:+.2f}u</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+st.subheader("Recommendation")
+st.markdown(f'<div class="rec-card">{recommendation}</div>', unsafe_allow_html=True)
