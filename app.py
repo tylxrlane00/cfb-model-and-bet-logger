@@ -58,12 +58,24 @@ from supabase import create_client, Client
 
 @st.cache_resource
 def get_sb() -> Client | None:
+    """
+    Prefer SB_URL + SB_SERVICE_KEY (your requirement).
+    Also supports secrets.supabase.{url,service_key} and fallbacks.
+    """
     cfg = st.secrets.get("supabase", {})
-    url = cfg.get("url") or os.environ.get("SB_URL")
-    key = cfg.get("anon_key") or os.environ.get("SB_SERVICE_KEY")
+    url = cfg.get("url") or os.environ.get("SB_URL") or os.environ.get("SUPABASE_URL")
+    key = (
+        cfg.get("service_key")
+        or os.environ.get("SB_SERVICE_KEY")
+        or cfg.get("anon_key")
+        or os.environ.get("SUPABASE_ANON_KEY")
+    )
     if not url or not key:
         return None
-    return create_client(url, key)
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
 
 sb: Client | None = get_sb()
 USE_DB = sb is not None
@@ -150,60 +162,122 @@ def status_badge_html(status: str) -> str:
 # ---------- DB helpers ----------
 def db_list_bets():
     if USE_DB:
-        res = sb.table("bets").select("*").order("created_at", desc=True).execute()
-        return res.data or []
+        try:
+            res = sb.table("bets").select("*").order("created_at", desc=True).execute()
+            return res.data or []
+        except Exception as e:
+            st.warning(f"DB list bets failed: {e}")
+            return []
     return st.session_state.get("bets", [])
 
+def _first_row(resp):
+    try:
+        data = getattr(resp, "data", None)
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data
+    except Exception:
+        return None
+
 def db_add_bet(rec: dict):
+    """Insert a bet; ignore any fields the DB doesn't know (e.g., notify_discord)."""
     if USE_DB:
-        ins = sb.table("bets").insert(rec).select("*").single().execute()
-        return ins.data
+        try:
+            # only keep columns that exist in the table schema
+            allowed = {
+                "bettor","book","type","side","ou","home_based_line","total_line",
+                "price","stake","status","note","home_team","away_team","created_at","id"
+            }
+            payload = {k: v for k, v in rec.items() if k in allowed and v is not None}
+            resp = sb.table("bets").insert(payload).execute()
+            # read back the first row if returned; otherwise return original (minus UI fields)
+            data = getattr(resp, "data", None)
+            row = (data[0] if isinstance(data, list) and data else None) or payload
+            return row
+        except Exception as e:
+            st.warning(f"DB insert bet failed: {e}")
+            # fall back to local so the UI is usable even if DB insert fails
+            rec_local = rec.copy()
+            rec_local["id"] = rec_local.get("id") or str(uuid.uuid4())
+            st.session_state.setdefault("bets", []).insert(0, rec_local)
+            return rec_local
+
+    # local fallback (no DB configured)
     rec = rec.copy()
     rec["id"] = rec.get("id") or str(uuid.uuid4())
     st.session_state.setdefault("bets", []).insert(0, rec)
     return rec
 
+
 def db_update_bet_status(bet_id: str, status: str):
     if USE_DB:
-        sb.table("bets").update({"status": status}).eq("id", bet_id).execute()
-        return
+        try:
+            sb.table("bets").update({"status": status}).eq("id", bet_id).execute()
+            return
+        except Exception as e:
+            st.warning(f"DB update bet failed: {e}")
     for x in st.session_state.get("bets", []):
         if x.get("id") == bet_id:
             x["status"] = status
 
 def db_delete_bet(bet_id: str):
     if USE_DB:
-        sb.table("bets").delete().eq("id", bet_id).execute()
-        return
+        try:
+            sb.table("bets").delete().eq("id", bet_id).execute()
+            return
+        except Exception as e:
+            st.warning(f"DB delete bet failed: {e}")
     arr = st.session_state.get("bets", [])
     st.session_state["bets"] = [x for x in arr if x.get("id") != bet_id]
 
 def db_list_projections():
     if USE_DB:
-        res = sb.table("projections").select("*").order("created_at", desc=True).execute()
-        return res.data or []
+        try:
+            res = sb.table("projections").select("*").order("created_at", desc=True).execute()
+            return res.data or []
+        except Exception as e:
+            st.warning(f"DB list projections failed: {e}")
+            return []
     return st.session_state.get("projections", [])
 
 def db_add_projection(p: dict):
     if USE_DB:
-        sb.table("projections").insert(p).execute()
-        return
+        try:
+            sb.table("projections").insert(p).execute()
+            return
+        except Exception as e:
+            st.warning(f"DB insert projection failed: {e}")
     st.session_state.setdefault("projections", []).insert(0, p)
 
 def db_delete_projection(pid: str):
     if USE_DB:
-        sb.table("projections").delete().eq("id", pid).execute()
-        return
+        try:
+            sb.table("projections").delete().eq("id", pid).execute()
+            return
+        except Exception as e:
+            st.warning(f"DB delete projection failed: {e}")
     arr = st.session_state.get("projections", [])
     st.session_state["projections"] = [x for x in arr if x.get("id") != pid]
 
 def send_discord_bet(bet: dict):
     if not USE_DB:
         return
+    payload = {"op": "notify-bet", "bet": bet}
     try:
-        sb.functions.invoke("discord-bot", body={"op": "notify-bet", "bet": bet})
+        # Try modern signature first
+        try:
+            resp = sb.functions.invoke("discord-bot", body=payload)
+        except TypeError:
+            # Fallback for older supabase-py
+            resp = sb.functions.invoke("discord-bot", invoke_options={"body": payload})
+
+        # Surface non-2xx responses if SDK exposes them
+        status = getattr(resp, "status_code", None)
+        if status and int(status) >= 300:
+            st.warning(f"Discord function error ({status}): {getattr(resp, 'data', resp)}")
     except Exception as e:
         st.warning(f"Discord notify failed: {e}")
+
 
 # ---------- Header & Upload ----------
 st.title("🥜 The Goober Model")
