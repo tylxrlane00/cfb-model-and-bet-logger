@@ -1095,28 +1095,58 @@ with tab_snap:
 # ---------- Model Guide ----------
 with tab_guide:
     st.subheader("Model Guide")
-    st.markdown("""
-**Acronyms**  
-- **SOS** — *Strength of Schedule* **rank** to date (1 = hardest).  
-- **SOR** — *Strength of Record* **rank** (1 = best resume vs schedule).  
+    st.markdown(
+        """
+### Acronyms
+- **FPI** — Football Power Index (rating; higher = better).
+- **SOS** — *Strength of Schedule* **rank** to date (1 = hardest).
+- **SOR** — *Strength of Record* **rank** (1 = best resume vs schedule).
 - **GC** — *Game Control* **rank** (1 = most wire-to-wire control).
+- **OFF/DEF/SP_EFF** — Offense / Defense / Special Teams efficiencies (0–100 style).
 
-**What the model does**
+---
 
-- Uses **FPI** to set a baseline **Model Margin** (Home − Away) plus optional **home field**.
-- Builds **Model Total** from offense/defense/special-teams efficiencies vs league averages, then nudges for **weather**.
-- Lets you compare & **blend** with sportsbook numbers (weight **w**).
-- Optional **grounding**: small, bounded corrections using **SOS** (schedule difficulty) and **resume** ranks (**SOR**, **GC**) to temper inflation.
+### What the model does (high level)
+1) **Model Margin (Home − Away)** starts from FPI and Home Field Advantage (HFA).  
+2) **Model Total** starts at a base league average and is nudged by:
+   - Offense vs Defense balance (**α**)  
+   - Special teams (**β**)  
+   - Weather (temp/wind/precip; ignored indoors/roof closed)
+3) **Grounding (optional)** applies small, bounded corrections:
+   - **SOS** (harder/easier slates): tiny margin nudge; can also alter spread **σ**  
+   - **Resume (SOR & GC)**: tiny, capped margin nudge; can also alter spread **σ**
+4) **Market blending (w)** mixes your model with sportsbook numbers to produce **Blended** line/total.
+5) **Probabilities & EV** come from treating margin/total as noisy (Normal) with adjustable **σ**.
 
-**How to read the snapshot numbers**
+---
 
-- **Ranks (SOS/SOR/GC):** `rank • centered` where centered ∈ **[-0.50, +0.50]** (higher = harder/better).  
-- **Values (FPI & efficiencies):** `value • Δ` where Δ is **value − league average**.
+### Controls & what they change
+- **Home Field Advantage (pts)** — adds directly to the home team in Model Margin  
+- **Base Total** — starting point for Model Total before nudges  
+- **α (OFF vs DEF)** — how much offenses vs defenses push **totals**  
+- **β (Special Teams)** — small totals nudge from special teams  
+- **σ (spread)** — uncertainty for margin; affects win/cover probabilities and EV  
+- **σ (total)** — uncertainty for the game total; affects P(Over/Under) and EV  
+- **Neutral site** — removes HFA  
+- **Indoors / Roof closed** — ignores weather effects  
+- **Weather** — temp, wind, precipitation each reduce totals a bit when adverse  
+- **Market Spread / Market Total / Prices** — used for P(cover/over) and EV  
+- **Blend weight (w)** — blend of market & model → **Blended** outputs  
+- **SOS / Resume** — tiny, controlled margin nudges; optional **σ** shrink/expand
 
-**Key outputs**
+---
 
-- **Model Margin (favored team)** — shows who’s favored and by how much.  
-  **Model Home Line** is the sportsbook notation: **negative** when the home team is favored (Home line = −Model margin).
-- **Model/Blended Totals**, **Rounded (median) scores**, **probabilities/EV** based on **σ (spread/total)**.
-- **σ (spread, effective)** shows post-grounding volatility.
-""")
+### Reading the outputs
+- **Model Margin (favored team)** — who’s favored & by how much (home minus away).  
+  **Model Home Line** converts that to sportsbook notation: `Home line = −(Model margin)`.
+- **Model Total** — implied points after all nudges.
+- **Score Cards** — median scores implied by Model or **Blended** numbers.
+- **Home Win Prob / P(Home line covers)** — probabilities from the model + **σ (spread, effective)**.
+- **Probability Over** — P(game total > market total) using **σ (total)**.
+- **EV** — expected value per 1u at given American odds (positive = +EV).
+- **σ (spread, effective)** — final uncertainty after SOS/Resume scaling (smaller = more confident).
+
+**Tip:** Use grounding sparingly. The idea is to *temper* ratings (e.g., soft schedules inflate teams), not to rewrite them. Keep σ realistic; overly small σ will overstate edges.
+        """
+    )
+
