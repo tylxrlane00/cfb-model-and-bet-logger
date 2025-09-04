@@ -390,7 +390,7 @@ st.sidebar.header("📄 Upload data")
 csv_file = st.sidebar.file_uploader("Combined CSV (FPI + Efficiencies)", type=["csv"], accept_multiple_files=False)
 
 st.sidebar.markdown("### Admin / Debug")
-if st.sidebar.button("🔔 Send weekly recap now"):
+if st.sidebar.button("🔔 Deploy Weekly Recap"):
     ok, detail = trigger_weekly_recap(force=True)
     (st.sidebar.success if ok else st.sidebar.warning)(f"Weekly recap: {'sent' if ok else 'failed'} ({detail})")
 
