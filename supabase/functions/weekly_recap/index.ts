@@ -1,123 +1,166 @@
-// deno-lint-ignore-file no-explicit-any
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
+/// <reference lib="deno.window" />
+/// <reference lib="dom" />
+
+// Weekly recap for public.bets (status in ['win','loss','push'])
+// Env: SB_URL, SB_SERVICE_ROLE_KEY, DISCORD_WEBHOOK_URL, TZ (e.g. America/Chicago), TAG (optional grouping key)
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { DateTime } from "https://esm.sh/luxon@3.4.4";
 
 type Bet = {
-  bettor: string;
-  book?: string | null;
-  type: "Spread" | "Total" | "Moneyline";
-  side?: "Home" | "Away" | null;
-  ou?: "Over" | "Under" | null;
-  home_based_line?: number | null;
-  total_line?: number | null;
-  price?: number | null;
-  stake?: number | null;
-  status?: "pending" | "win" | "loss" | "push";
-  note?: string | null;
-  home_team: string;
-  away_team: string;
+  created_at: string;
+  bettor: string | null;
+  price: number | null;
+  stake: number | null;
+  status: string | null;
 };
 
-function num(v: any, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+const SB_URL = Deno.env.get("SB_URL")!;
+const SB_SERVICE_ROLE_KEY = Deno.env.get("SB_SERVICE_ROLE_KEY")!;
+const DISCORD_WEBHOOK_URL = Deno.env.get("DISCORD_WEBHOOK_URL")!;
+const TZ = Deno.env.get("TZ") || "America/Chicago";
+const TAG = Deno.env.get("TAG") || "default";
 
-async function postDiscordJSON(webhook: string, body: any) {
-  return fetch(webhook, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+const sb = createClient(SB_URL, SB_SERVICE_ROLE_KEY);
+
+// --- helpers ---
+function unitsFromAmerican(odds: number | null): number {
+  if (odds === null || Number.isNaN(odds)) return 1.0;
+  return odds < 0 ? 100 / Math.abs(odds) : odds / 100;
+}
+function profitUnits(b: Bet): number {
+  const stake = Number(b.stake ?? 1);
+  const u = unitsFromAmerican(b.price ?? -110);
+  const res = String(b.status || "pending").toLowerCase();
+  if (res === "win") return stake * u;
+  if (res === "loss") return -stake;
+  return 0;
+}
+function weekStart(dt: DateTime): DateTime {
+  return dt.startOf("week"); // Monday
 }
 
-async function notifyBet(webhook: string, payload: any) {
-  const bet: Bet = payload.bet ?? payload;
-  const price = num(bet.price); const stake = num(bet.stake, 1);
-
-  let title = "";
-  if (bet.type === "Total") {
-    title = `${bet.bettor} bet: ${bet.ou} ${num(bet.total_line).toFixed(1)}`;
-  } else if (bet.type === "Spread") {
-    const who = bet.side === "Home" ? bet.home_team : bet.away_team;
-    const ln = num(bet.home_based_line);
-    title = `${bet.bettor} bet: ${bet.side} (${who}) ${ln > 0 ? `+${ln}` : ln}`;
-  } else {
-    const who = bet.side === "Home" ? bet.home_team : bet.away_team;
-    title = `${bet.bettor} bet: ${bet.side} (${who}) ML`;
+async function alreadySent(weekStartIsoDate: string): Promise<boolean> {
+  const { data, error } = await sb
+    .from("bot_runs")
+    .select("id")
+    .eq("tag", TAG)
+    .eq("week_start", weekStartIsoDate)
+    .limit(1);
+  if (error) {
+    console.log("bot_runs check error", error);
+    return false;
   }
-
-  const lines = [
-    `Matchup: **${bet.away_team} @ ${bet.home_team}**`,
-    `Type: **${bet.type}**`,
-  ];
-
-  if (bet.type === "Total") {
-    lines.push(`Selection: **${bet.ou} ${num(bet.total_line).toFixed(1)}**`);
-  } else if (bet.type === "Spread") {
-    const who = bet.side === "Home" ? bet.home_team : bet.away_team;
-    const ln = num(bet.home_based_line);
-    lines.push(`Selection: **${bet.side} (${who}) ${ln > 0 ? `+${ln}` : ln}**`);
-  } else {
-    const who = bet.side === "Home" ? bet.home_team : bet.away_team;
-    lines.push(`Selection: **${bet.side} (${who}) ML**`);
-  }
-
-  lines.push(`Price: **${price}**`);
-  lines.push(`Stake: **${stake}**`);
-  if (bet.book) lines.push(`Book: **${bet.book}**`);
-  if (bet.note) lines.push(`Note: ${bet.note}`);
-
-  await postDiscordJSON(webhook, {
-    embeds: [{ title, description: lines.join("\n"), color: 0x1f8b4c, timestamp: new Date().toISOString() }],
-  });
-
-  return { ok: true };
+  return (data?.length || 0) > 0;
+}
+async function markSent(weekStartIsoDate: string) {
+  const { error } = await sb.from("bot_runs").insert({ tag: TAG, week_start: weekStartIsoDate });
+  if (error) console.log("bot_runs insert error", error);
 }
 
-async function weeklyRoundup(webhook: string, supabaseUrl: string, serviceRoleKey: string) {
-  const sb = createClient(supabaseUrl, serviceRoleKey);
-  const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const { data, error } = await sb.from("bets").select("bettor,status,stake,price,created_at").gte("created_at", since);
-  if (error) throw new Error(error.message);
-
-  const rec: Record<string, { win: number; loss: number; push: number; pending: number; count: number }> = {};
-  for (const b of data ?? []) {
-    const name = (b as any).bettor || "Unknown";
-    rec[name] ??= { win: 0, loss: 0, push: 0, pending: 0, count: 0 };
-    rec[name].count++;
-    const st = (b as any).status ?? "pending";
-    if (st in rec[name]) (rec[name] as any)[st]++; else rec[name].pending++;
-  }
-
-  const lines = Object.entries(rec).map(([name, r]) => `**${name}** — ${r.win}-${r.loss}-${r.push}  (bets: ${r.count})`);
-  const content = lines.length ? `**Weekly Roundup** (last 7 days)\n${lines.join("\n")}` : "Weekly Roundup: No bets logged this week.";
-  await postDiscordJSON(webhook, { content });
-  return { ok: true, weekly: true };
+function summarize(bets: Bet[]) {
+  const w = bets.filter(b => (b.status || "").toLowerCase() === "win").length;
+  const l = bets.filter(b => (b.status || "").toLowerCase() === "loss").length;
+  const p = bets.filter(b => (b.status || "").toLowerCase() === "push").length;
+  const units = bets.reduce((acc, r) => acc + profitUnits(r), 0);
+  const risked = bets.reduce((acc, r) => acc + Number(r.stake ?? 0), 0);
+  const roi = risked > 0 ? units / risked : 0;
+  return { w, l, p, units, roi, n: bets.length };
 }
 
-export default async (req: Request) => {
-  const WEBHOOK = Deno.env.get("DISCORD_WEBHOOK_URL");
-  if (!WEBHOOK) return new Response("Missing DISCORD_WEBHOOK_URL", { status: 500 });
-
+Deno.serve(async (req) => {
   try {
-    const url = new URL(req.url);
-    const opParam = url.searchParams.get("op");
-    const scheduled =
-      req.headers.get("x-scheduled") === "true" ||
-      req.headers.get("x-supabase-schedule") === "true" ||
-      opParam === "weekly-roundup";
+    const now = DateTime.now().setZone(TZ);
+    const weekStartLocal = weekStart(now).startOf("day");
+    const weekStartIsoDate = weekStartLocal.toISODate()!;
 
-    if (scheduled) {
-      const SB_URL = Deno.env.get("SB_URL");
-      const SR_KEY = Deno.env.get("SB_SERVICE_ROLE_KEY");
-      if (!SB_URL || !SR_KEY) {
-        return new Response("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY", { status: 500 });
-        }
-      const res = await weeklyRoundup(WEBHOOK, SB_URL, SR_KEY);
-      return new Response(JSON.stringify(res), { headers: { "content-type": "application/json" } });
+    const force = new URL(req.url).searchParams.get("force") === "1";
+    const isSunday = now.weekday === 7;
+    const is3pmTop = now.hour === 15 && now.minute === 0;
+
+    if (!force) {
+      if (!(isSunday && is3pmTop)) {
+        return new Response(JSON.stringify({ ok: true, skipped: true, reason: "outside schedule" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (await alreadySent(weekStartIsoDate)) {
+        return new Response(JSON.stringify({ ok: true, skipped: true, reason: "already sent" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
     }
 
-    let payload: any = {};
-    if ((req.headers.get("content-type") || "").includes("application/json")) {
-      payload = await req.json();
+    // window: Monday 00:00 local -> now
+    const startUTC = weekStartLocal.toUTC();
+    const nowUTC = now.toUTC();
+
+    const { data, error } = await sb
+      .from("bets")
+      .select("created_at,bettor,price,stake,status")
+      .in("status", ["win", "loss", "push"])
+      .gte("created_at", startUTC.toISO()!)
+      .lt("created_at", nowUTC.toISO()!)
+      .limit(5000);
+
+    if (error) throw error;
+    const rows = (data || []) as Bet[];
+
+    // group by bettor
+    const byBettor = new Map<string, Bet[]>();
+    for (const r of rows) {
+      const k = (r.bettor || "Unknown").toString();
+      if (!byBettor.has(k)) byBettor.set(k, []);
+      byBettor.get(k)!.push(r);
     }
-    const res = await notifyBet(WEBHOOK, payload);
-    return new Response(JSON.stringify(res), { headers: { "content-type": "application/json" } });
+
+    // embed
+    const title = `Weekly Recap ${weekStartLocal.toISODate()} → ${now.toISODate()}`;
+    const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+    for (const [name, arr] of byBettor.entries()) {
+      const s = summarize(arr);
+      fields.push({
+        name,
+        value: `**${s.w}-${s.l}-${s.p}** • ${s.units >= 0 ? "+" : ""}${s.units.toFixed(2)}u • ROI ${(s.roi * 100).toFixed(1)}% • ${s.n} bets`,
+        inline: false,
+      });
+    }
+    const tot = summarize(rows);
+    if (rows.length > 0) {
+      fields.push({
+        name: "All Bettors",
+        value: `**${tot.w}-${tot.l}-${tot.p}** • ${tot.units >= 0 ? "+" : ""}${tot.units.toFixed(2)}u • ROI ${(tot.roi * 100).toFixed(1)}% • ${tot.n} bets`,
+        inline: false,
+      });
+    }
+
+    const embed = {
+      title,
+      description: rows.length ? "" : "No graded bets for the period.",
+      color: 0x22c55e, // green
+      timestamp: now.toUTC().toISO(),
+      footer: { text: TAG },
+      fields,
+    };
+
+    const resp = await fetch(DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ embeds: [embed] }),
+    });
+
+    const ok = resp.ok;
+    if (ok && !force) await markSent(weekStartIsoDate);
+
+    return new Response(JSON.stringify({ ok, count: rows.length }), {
+      headers: { "Content-Type": "application/json" },
+      status: ok ? 200 : 500,
+    });
   } catch (e) {
-    return new Response(`error: ${e}`, { status: 500 });
+    console.error(e);
+    return new Response(JSON.stringify({ ok: false, error: String(e) }), {
+      headers: { "Content-Type": "application/json" },
+      status: 500,
+    });
   }
-};
+});
