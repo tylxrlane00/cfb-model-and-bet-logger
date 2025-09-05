@@ -852,9 +852,14 @@ with tab_bets:
             home_based_line = None
             total_line = None
             if bet_type_choice == "Spread":
-                home_based_line = st.number_input("Line (home-based; -3.5 = Home -3.5)", value=-3.5, step=0.5)
+                is_home_pick = str(side).startswith("Home")
+                lbl = "Line for chosen team (e.g., -3.5 if your pick is -3.5)"
+                chosen_line = st.number_input(lbl, value=-3.5, step=0.5, key="chosen_line")
+                # Convert to *home-based* for storage: home stays same sign; away flips
+                home_based_line = float(chosen_line) if is_home_pick else -float(chosen_line)
             elif bet_type_choice == "Total":
                 total_line = st.number_input("Total (pts)", value=float(54.5), step=0.5)
+
 
         with l3:
             price = st.number_input("Price (American, optional)", value=-110, step=5)
@@ -928,9 +933,14 @@ with tab_bets:
                         sel_txt = f"{b.get('ou')} {float(b.get('total_line', 0)):.1f}"
                     elif b.get("type") == "Spread":
                         who = H if b.get("side") == "Home" else A
-                        line = b.get("home_based_line")
-                        if line is not None and float(line) > 0: line = f"+{float(line)}"
-                        sel_txt = f"{b.get('side')} ({who}) {line}"
+                        hb = b.get("home_based_line")
+                        if hb is None:
+                            line_txt = "—"
+                        else:
+                            val = float(hb) if b.get("side") == "Home" else -float(hb)
+                            line_txt = f"{val:+.1f}"
+                        sel_txt = f"{b.get('side')} ({who}) {line_txt}"
+
                     else:
                         who = H if b.get("side") == "Home" else A
                         sel_txt = f"{b.get('side')} ({who}) ML"
