@@ -261,7 +261,6 @@ def _build_bet_embed(b: dict) -> dict:
     # Build the “Spread | … @ price” line
     if typ == "Spread":
         hb = b.get("home_based_line")
-        # Which team was picked?
         team = H if side == "Home" else A
         if hb is None:
             sel = f"{team}"
@@ -270,12 +269,10 @@ def _build_bet_embed(b: dict) -> dict:
             line_for_pick = float(hb) if side == "Home" else -float(hb)
             sel = f"{team} {line_for_pick:+.1f}"
         mid = f"Spread | {sel} @ {odds_txt}"
-
     elif typ == "Total":
         ttl = b.get("total_line")
         ttl_txt = f"{float(ttl):.1f}" if isinstance(ttl, (int, float)) else "—"
         mid = f"Total | {ou} {ttl_txt} @ {odds_txt}"
-
     else:  # Moneyline
         team = H if side == "Home" else A
         mid = f"Moneyline | {team} ML @ {odds_txt}"
@@ -286,15 +283,10 @@ def _build_bet_embed(b: dict) -> dict:
 
     lines = [header, game, mid, stake_line]
     if note:
-        lines += ["", note]  # note on its own line, no “Note:” label
+        lines += ["", note]
 
     description = "\n".join(lines)
-
-    return {
-        "description": description,
-        "color": _bet_color(typ),
-        "timestamp": datetime.utcnow().isoformat() + "Z",  # Discord renders “Today at …”
-    }
+    return {"description": description, "color": _bet_color(typ), "timestamp": datetime.utcnow().isoformat() + "Z"}
 
 def _notify_discord_webhook(message: str | None = None, embed: dict | None = None) -> tuple[bool, str]:
     url = os.environ.get("DISCORD_WEBHOOK_URL") or st.secrets.get("DISCORD_WEBHOOK_URL")
@@ -313,13 +305,11 @@ def _notify_discord_webhook(message: str | None = None, embed: dict | None = Non
         return False, str(e)
 
 def send_discord_bet(bet: dict):
-    """Primary path: send embed directly to Discord webhook.
-       Fallback: call Supabase Edge Function 'discord-bot' if webhook fails/unset."""
     embed = _build_bet_embed(bet)
     ok, detail = _notify_discord_webhook(embed=embed)
     if ok:
         return
-    # Fallback to Edge Function (optional)
+    # Optional fallback via Edge Function
     sb_url = (os.environ.get("SB_URL") or st.secrets.get("supabase", {}).get("url"))
     srk = (
         os.environ.get("SB_SERVICE_KEY")
@@ -330,19 +320,15 @@ def send_discord_bet(bet: dict):
     if sb_url and srk:
         try:
             fn_url = f"{sb_url.rstrip('/')}/functions/v1/discord-bot"
-            requests.post(
-                fn_url,
-                json={"op": "notify-bet", "bet": bet},
-                headers={"Authorization": f"Bearer {srk}", "Content-Type": "application/json"},
-                timeout=6
-            )
+            requests.post(fn_url, json={"op": "notify-bet", "bet": bet},
+                          headers={"Authorization": f"Bearer {srk}", "Content-Type": "application/json"},
+                          timeout=6)
             return
         except Exception:
             pass
     st.warning(f"Discord send failed: {detail}")
 
 def trigger_weekly_recap(force: bool = True) -> tuple[bool, str]:
-    """Call your weekly recap Edge Function. Tries 'weekly_recap' then 'weekly-recap'."""
     try:
         sb_url = os.environ.get("SB_URL") or st.secrets["supabase"]["url"]
         svc_key = os.environ.get("SB_SERVICE_KEY") or st.secrets["supabase"]["anon_key"]
@@ -406,6 +392,27 @@ if csv_file:
             DATA_READY = True
     except Exception as e:
         st.error(f"Could not read CSV: {e}")
+
+# --- Apply any pending "Load projection" controls BEFORE any widgets are created
+def _apply_pending_controls(teams_list):
+    ss = st.session_state
+    vals = ss.pop("_pending_controls", None)
+    if not isinstance(vals, dict):
+        return
+    # Team keys first (only if valid for current CSV)
+    ht = vals.get("home_team_sel")
+    at = vals.get("away_team_sel")
+    if ht in teams_list:
+        ss["home_team_sel"] = ht
+    if at in teams_list:
+        ss["away_team_sel"] = at
+    # The rest
+    for k, v in vals.items():
+        if k in {"home_team_sel", "away_team_sel"}:
+            continue
+        ss[k] = v
+
+_apply_pending_controls(teams)
 
 # ---------- Tabs (always render) ----------
 tab_adj, tab_bets, tab_saved, tab_snap, tab_guide = st.tabs(
@@ -858,7 +865,6 @@ with tab_bets:
     st.markdown("### Log a Bet")
 
     # Bet type OUTSIDE the form so changing it re-renders dependent fields immediately
-    bettor_names = ["Zak", "Tyler", "John"]
     bet_type_choice = st.selectbox("Bet Type", ["Spread", "Total", "Moneyline"], key="bet_type_choice")
 
     with st.form("bet_form_v2", clear_on_submit=True):
@@ -1064,17 +1070,17 @@ with tab_saved:
 
                 cA, cB = st.columns([1,1])
                 with cA:
-                    if p.get("controls"):
+                    controls = p.get("controls")
+                    if isinstance(controls, dict):
                         if st.button("Load", key=f"load_{p.get('id', j)}"):
-                            # Push saved controls back into session_state (guard against missing teams)
-                            ss = st.session_state
-                            vals = p["controls"]
-                            if vals.get("home_team_sel") in teams: ss["home_team_sel"] = vals["home_team_sel"]
-                            if vals.get("away_team_sel") in teams: ss["away_team_sel"] = vals["away_team_sel"]
-                            for k, v in vals.items():
-                                if k not in ("home_team_sel", "away_team_sel"):
-                                    ss[k] = v
-                            st.success("Projection loaded — controls restored."); st.rerun()
+                            # Ensure teams present for current CSV; stage, then rerun
+                            to_stage = controls.copy()
+                            # (Redundant but explicit) — keep the saved teams on load
+                            to_stage["home_team_sel"] = controls.get("home_team_sel", home_team_p)
+                            to_stage["away_team_sel"] = controls.get("away_team_sel", away_team_p)
+                            st.session_state["_pending_controls"] = to_stage
+                            st.toast("Loaded projection; applying controls…")
+                            st.rerun()
                     else:
                         st.caption("Older save (no tunings stored). Save again to enable loading.")
                 with cB:
