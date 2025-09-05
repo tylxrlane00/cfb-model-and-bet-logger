@@ -365,6 +365,10 @@ st.title("🥜 The Goober Model")
 st.caption(
     "College Football Predictor — FPI & efficiencies with weather, market, and optional SOS / SOR / GC grounding. (Supabase-enabled)"
 )
+# ---- Sidebar logo (top) ----
+LOGO = st.secrets.get("APP_LOGO_URL", "assets/hilltopper.jpg")  # URL or local file
+st.sidebar.image(LOGO, use_container_width=True)
+st.sidebar.markdown("---")
 
 st.sidebar.header("📄 Upload data")
 csv_file = st.sidebar.file_uploader("Combined CSV (FPI + Efficiencies)", type=["csv"], accept_multiple_files=False)
