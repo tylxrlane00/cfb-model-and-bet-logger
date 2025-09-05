@@ -4,6 +4,7 @@
 # - Discord notify via direct Webhook (fast) with optional Edge Function fallback
 # - Keeps tab position when saving
 # - Uses stored team names on bets (works even without CSV)
+# - Saved projections capture ALL tunings and can be loaded back
 
 import math
 import os
@@ -290,12 +291,10 @@ def _build_bet_embed(b: dict) -> dict:
     description = "\n".join(lines)
 
     return {
-        # no title; everything is in the description per your spec
         "description": description,
         "color": _bet_color(typ),
         "timestamp": datetime.utcnow().isoformat() + "Z",  # Discord renders “Today at …”
     }
-
 
 def _notify_discord_webhook(message: str | None = None, embed: dict | None = None) -> tuple[bool, str]:
     url = os.environ.get("DISCORD_WEBHOOK_URL") or st.secrets.get("DISCORD_WEBHOOK_URL")
@@ -372,13 +371,10 @@ def trigger_weekly_recap(force: bool = True) -> tuple[bool, str]:
         except Exception as e:
             return False, str(e), 0
 
-    # Your project shows weekly_recap — try that first, then the dashed variant
     ok, detail, code = _call("weekly_recap")
     if not ok and code == 404:
         ok, detail, _ = _call("weekly-recap")
     return ok, detail
-
-
 
 # ---------- Header & Upload ----------
 st.title("🥜 The Goober Model")
@@ -393,7 +389,6 @@ st.sidebar.markdown("### Admin / Debug")
 if st.sidebar.button("🔔 Deploy Weekly Recap"):
     ok, detail = trigger_weekly_recap(force=True)
     (st.sidebar.success if ok else st.sidebar.warning)(f"Weekly recap: {'sent' if ok else 'failed'} ({detail})")
-
 
 DATA_READY = False
 df = None
@@ -422,12 +417,12 @@ with tab_adj:
     if not DATA_READY:
         st.info("Upload your combined CSV in the sidebar to use the predictor.", icon="🔎")
     else:
-        # --- team pickers
+        # --- team pickers (keyed so they can be restored)
         cA, cB = st.columns(2)
         with cA:
-            home_team = st.selectbox("Home Team", teams, index=0 if teams else None)
+            home_team = st.selectbox("Home Team", teams, index=0 if teams else None, key="home_team_sel")
         with cB:
-            away_team = st.selectbox("Away Team", teams, index=1 if len(teams) > 1 else 0)
+            away_team = st.selectbox("Away Team", teams, index=1 if len(teams) > 1 else 0, key="away_team_sel")
         if home_team == away_team:
             st.warning("Please select two different teams.", icon="⚠️")
             st.stop()
@@ -436,43 +431,54 @@ with tab_adj:
         away_row = get_team_row(df, away_team)
         (off_mean, def_mean, sp_mean, ovrl_mean, fpi_mean, fpi_min, fpi_max) = league_means(df)
 
-        # --- adjustments UI
+        # --- adjustments UI (all keyed)
         st.subheader("Model & Market Adjustments")
         g1, g2, g3, g4 = st.columns(4)
         with g1:
             hfa_pts = st.slider(
-                "Home Field Advantage (pts)", 0.0, 5.0, 2.5, 0.1, help="Adds to the HOME team’s expected margin. Typical CFB ~2–3 points."
+                "Home Field Advantage (pts)", 0.0, 5.0, 2.5, 0.1, key="hfa_pts",
+                help="Adds to the HOME team’s expected margin. Typical CFB ~2–3 points."
             )
             base_total = st.slider(
-                "Base Total (league avg)", 40.0, 70.0, 54.0, 0.5, help="Starting point for total points before efficiency & weather nudges."
+                "Base Total (league avg)", 40.0, 70.0, 54.0, 0.5, key="base_total",
+                help="Starting point for total points before efficiency & weather nudges."
             )
         with g2:
             alpha_total = st.slider(
-                "α (OFF vs DEF)", 0.0, 1.0, 0.30, 0.01, help="How strongly good offense / weak defense pushes totals up (and vice versa)."
+                "α (OFF vs DEF)", 0.0, 1.0, 0.30, 0.01, key="alpha_total",
+                help="How strongly good offense / weak defense pushes totals up (and vice versa)."
             )
             beta_st = st.slider(
-                "β (Special Teams)", 0.0, 0.3, 0.05, 0.01, help="Small nudge from special teams efficiency; keep modest."
+                "β (Special Teams)", 0.0, 0.3, 0.05, 0.01, key="beta_st",
+                help="Small nudge from special teams efficiency; keep modest."
             )
         with g3:
             sigma_margin = st.slider(
-                "σ (spread) — pts", 6.0, 21.0, 13.0, 0.5, help="How noisy game margins are. Larger σ ⇒ less certain spreads & cover %."
+                "σ (spread) — pts", 6.0, 21.0, 13.0, 0.5, key="sigma_margin",
+                help="How noisy game margins are. Larger σ ⇒ less certain spreads & cover %."
             )
             sigma_total = st.slider(
-                "σ (total) — pts", 6.0, 21.0, 10.0, 0.5, help="How noisy totals are. Larger σ ⇒ P(Over/Under) closer to 50%."
+                "σ (total) — pts", 6.0, 21.0, 10.0, 0.5, key="sigma_total",
+                help="How noisy totals are. Larger σ ⇒ P(Over/Under) closer to 50%."
             )
         with g4:
-            neutral_site = st.checkbox("Neutral site", value=False, help="Remove HFA from the spread if played at a neutral site.")
-            indoor_roof = st.checkbox("Indoors / Roof closed", value=False, help="Ignore weather if conditions are controlled.")
+            neutral_site = st.checkbox("Neutral site", value=False, key="neutral_site",
+                                       help="Remove HFA from the spread if played at a neutral site.")
+            indoor_roof = st.checkbox("Indoors / Roof closed", value=False, key="indoor_roof",
+                                      help="Ignore weather if conditions are controlled.")
 
         st.markdown("#### Weather (ignored if indoors/roof closed)")
         w1, w2, w3 = st.columns(3)
         with w1:
-            temp_f = st.slider("Temperature (°F)", 10, 100, 70, 1, help="Cold (<40°F) or hot (>85°F) slightly reduces expected scoring.")
+            temp_f = st.slider("Temperature (°F)", 10, 100, 70, 1, key="temp_f",
+                               help="Cold (<40°F) or hot (>85°F) slightly reduces expected scoring.")
         with w2:
-            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, help="Above ~10 mph, wind trims passing/kicking efficiency and lowers totals.")
+            wind_mph = st.slider("Wind (mph)", 0, 40, 5, 1, key="wind_mph",
+                                 help="Above ~10 mph, wind trims passing/kicking efficiency and lowers totals.")
         with w3:
             precip = st.select_slider(
-                "Precipitation", options=["None", "Light", "Moderate", "Heavy"], value="None", help="Rain/snow reduces totals; heavier lowers more."
+                "Precipitation", options=["None", "Light", "Moderate", "Heavy"], value="None", key="precip",
+                help="Rain/snow reduces totals; heavier lowers more."
             )
 
         st.divider()
@@ -480,17 +486,22 @@ with tab_adj:
         m1, m2, m3, m4 = st.columns(4)
         with m1:
             market_spread_home = st.number_input(
-                "Market Spread (home line)", value=-3.5, step=0.5, help="Sportsbook home line (negative means home favorite)."
+                "Market Spread (home line)", value=-3.5, step=0.5, key="market_spread_home",
+                help="Sportsbook home line (negative means home favorite)."
             )
         with m2:
-            market_total = st.number_input("Market Total", value=54.5, step=0.5, help="Sportsbook total points line.")
+            market_total = st.number_input("Market Total", value=54.5, step=0.5, key="market_total",
+                                           help="Sportsbook total points line.")
         with m3:
-            spread_price = st.number_input("Spread Price (American)", value=-110, step=5, help="Price for the spread (e.g., -110).")
+            spread_price = st.number_input("Spread Price (American)", value=-110, step=5, key="spread_price",
+                                           help="Price for the spread (e.g., -110).")
         with m4:
-            total_price = st.number_input("Total Price (American)", value=-110, step=5, help="Price for Over/Under (e.g., -110).")
+            total_price = st.number_input("Total Price (American)", value=-110, step=5, key="total_price",
+                                          help="Price for Over/Under (e.g., -110).")
 
         st.markdown("#### Blending")
-        blend_weight = st.slider("Market Blend Weight (w)", 0.0, 1.0, 0.35, 0.05, help="0 = pure model; 1 = pure market.")
+        blend_weight = st.slider("Market Blend Weight (w)", 0.0, 1.0, 0.35, 0.05, key="blend_weight",
+                                 help="0 = pure model; 1 = pure market.")
 
         # ----- Grounding + snapshot
         st.divider()
@@ -508,11 +519,11 @@ with tab_adj:
             else:
                 adj_sos = st.checkbox(
                     "Adjust for schedule strength (SOS rank 1=hardest)",
-                    value=False,
+                    value=False, key="adj_sos",
                     help="Nudges the model margin for harder/easier schedules and can adjust spread σ."
                 )
-                sos_weight = st.slider("SOS weight (points)", 0.0, 2.0, 0.6, 0.1, disabled=not adj_sos)
-                sos_sigma_pct = st.slider("SOS → σ multiplier (±%)", 0, 40, 0, 5, disabled=not adj_sos)
+                sos_weight = st.slider("SOS weight (points)", 0.0, 2.0, 0.6, 0.1, key="sos_weight", disabled=not adj_sos)
+                sos_sigma_pct = st.slider("SOS → σ multiplier (±%)", 0, 40, 0, 5, key="sos_sigma_pct", disabled=not adj_sos)
 
             if not (has_SOR and has_GC):
                 st.info("`SOR` and/or `GC` columns not found — resume grounding disabled.", icon="ℹ️")
@@ -520,18 +531,18 @@ with tab_adj:
             else:
                 adj_resume = st.checkbox(
                     "Adjust for resume (SOR & GC ranks 1=best)",
-                    value=False,
+                    value=False, key="adj_resume",
                     help="Tiny, capped margin nudge; optional σ scaling."
                 )
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    sor_w = st.slider("SOR weight (pts)", 0.0, 1.0, 0.4, 0.1, disabled=not adj_resume)
+                    sor_w = st.slider("SOR weight (pts)", 0.0, 1.0, 0.4, 0.1, key="sor_w", disabled=not adj_resume)
                 with c2:
-                    gc_w  = st.slider("GC weight (pts)", 0.0, 1.0, 0.3, 0.1, disabled=not adj_resume)
+                    gc_w  = st.slider("GC weight (pts)", 0.0, 1.0, 0.3, 0.1, key="gc_w", disabled=not adj_resume)
                 with c3:
-                    resume_cap = st.slider("Resume nudge cap (±pts)", 0.0, 1.5, 1.0, 0.1, disabled=not adj_resume)
+                    resume_cap = st.slider("Resume nudge cap (±pts)", 0.0, 1.5, 1.0, 0.1, key="resume_cap", disabled=not adj_resume)
                 with c4:
-                    resume_sigma_pct = st.slider("Resume → σ multiplier (±%)", 0, 30, 0, 5, disabled=not adj_resume)
+                    resume_sigma_pct = st.slider("Resume → σ multiplier (±%)", 0, 30, 0, 5, key="resume_sigma_pct", disabled=not adj_resume)
 
         with gright:
             st.markdown("**Current Matchup | Resume Snapshot**")
@@ -655,15 +666,39 @@ with tab_adj:
 
         model_home_spread_str, _ = format_home_away_spreads(home_team, away_team, home_line_model)
         blended_home_spread_str, _ = format_home_away_spreads(home_team, away_team, blend_home_line)
+        home_line_market_lbl, _ = format_home_away_spreads(home_team, away_team, market_spread_home)
+
+        # ---------- Save snapshot for "Save current projection" (now with full controls)
+        controls_snapshot = {
+            "home_team_sel": home_team, "away_team_sel": away_team,
+            "hfa_pts": hfa_pts, "base_total": base_total,
+            "alpha_total": alpha_total, "beta_st": beta_st,
+            "sigma_margin": sigma_margin, "sigma_total": sigma_total,
+            "neutral_site": neutral_site, "indoor_roof": indoor_roof,
+            "temp_f": temp_f, "wind_mph": wind_mph, "precip": precip,
+            "market_spread_home": market_spread_home, "market_total": market_total,
+            "spread_price": spread_price, "total_price": total_price,
+            "blend_weight": blend_weight,
+            "adj_sos": bool(adj_sos), "sos_weight": float(sos_weight), "sos_sigma_pct": int(sos_sigma_pct),
+            "adj_resume": bool(adj_resume), "sor_w": float(sor_w), "gc_w": float(gc_w),
+            "resume_cap": float(resume_cap), "resume_sigma_pct": int(resume_sigma_pct),
+        }
+
         st.session_state.latest_projection = {
             "home_team": home_team, "away_team": away_team,
             "home_pts": float(home_pts_model), "away_pts": float(away_pts_model),
             "total_model": float(total_model), "total_blended": float(total_blended),
             "model_home_spread_str": model_home_spread_str,
             "blended_home_spread_str": blended_home_spread_str,
+            "market_home_spread_str": home_line_market_lbl,
+            "p_cover_market_home": float(p_home_cover_model),
+            "sigma_margin_eff": float(sigma_margin_eff),
             "recommendation": recommendation,
+            "controls": controls_snapshot,
+            "saved_at": datetime.utcnow().isoformat() + "Z",
         }
 
+        # ---------- UI cards ----------
         st.markdown("### 🧾 Score Cards")
         sc1, sc2 = st.columns(2)
         with sc1:
@@ -860,11 +895,11 @@ with tab_bets:
             elif bet_type_choice == "Total":
                 total_line = st.number_input("Total (pts)", value=float(54.5), step=0.5)
 
-
         with l3:
             price = st.number_input("Price (American, optional)", value=-110, step=5)
             stake = st.number_input("Stake (units or dollars)", value=1.0, min_value=0.0, step=0.5)
-            notify_discord = st.checkbox("🔔 Notify Discord", value=False)
+            # Default: notify ON
+            notify_discord = st.checkbox("🔔 Notify Discord", value=True)
 
         note = st.text_area("Description / Note (optional)", "")
         submitted = st.form_submit_button("Save Bet")
@@ -894,7 +929,6 @@ with tab_bets:
                 send_discord_bet(row or record)
             st.success("Bet saved.")
             st.rerun()
-
 
     # Board columns
     def _pass_filter(b):
@@ -930,7 +964,8 @@ with tab_bets:
                     H = b.get("home_team", "Home")
                     A = b.get("away_team", "Away")
                     if b.get("type") == "Total":
-                        sel_txt = f"{b.get('ou')} {float(b.get('total_line', 0)):.1f}"
+                        ttl = float(b.get("total_line", 0))
+                        sel_txt = f"{A} @ {H} — {b.get('ou')} {ttl:.1f}"
                     elif b.get("type") == "Spread":
                         who = H if b.get("side") == "Home" else A
                         hb = b.get("home_based_line")
@@ -940,7 +975,6 @@ with tab_bets:
                             val = float(hb) if b.get("side") == "Home" else -float(hb)
                             line_txt = f"{val:+.1f}"
                         sel_txt = f"{b.get('side')} ({who}) {line_txt}"
-
                     else:
                         who = H if b.get("side") == "Home" else A
                         sel_txt = f"{b.get('side')} ({who}) ML"
@@ -1021,9 +1055,31 @@ with tab_saved:
                     st.write(f"**Model:** {home_team_p} {hp:.1f} — {away_team_p} {ap:.1f}")
                 st.write(f"Spread: {model_spread_str} | Total: {tm:.1f}" if not np.isnan(tm) else f"Spread: {model_spread_str}")
                 if not np.isnan(tb): st.write(f"**Blended:** Spread {blended_spread_str} | Total {tb:.1f}")
+
+                # Cover % captured at save time vs market home line
+                if p.get("market_home_spread_str") and p.get("p_cover_market_home") is not None:
+                    st.write(f"Cover: P({p['market_home_spread_str']} covers) {100*float(p['p_cover_market_home']):.1f}%")
+
                 st.write(f"**Rec:** {p.get('recommendation','—')}")
-                if st.button("Delete saved", key=f"dels_{p.get('id', j)}"):
-                    db_delete_projection(p.get("id","")); st.rerun()
+
+                cA, cB = st.columns([1,1])
+                with cA:
+                    if p.get("controls"):
+                        if st.button("Load", key=f"load_{p.get('id', j)}"):
+                            # Push saved controls back into session_state (guard against missing teams)
+                            ss = st.session_state
+                            vals = p["controls"]
+                            if vals.get("home_team_sel") in teams: ss["home_team_sel"] = vals["home_team_sel"]
+                            if vals.get("away_team_sel") in teams: ss["away_team_sel"] = vals["away_team_sel"]
+                            for k, v in vals.items():
+                                if k not in ("home_team_sel", "away_team_sel"):
+                                    ss[k] = v
+                            st.success("Projection loaded — controls restored."); st.rerun()
+                    else:
+                        st.caption("Older save (no tunings stored). Save again to enable loading.")
+                with cB:
+                    if st.button("Delete saved", key=f"dels_{p.get('id', j)}"):
+                        db_delete_projection(p.get("id","")); st.rerun()
 
 # ---------- Matchup Snapshot ----------
 with tab_snap:
@@ -1066,7 +1122,7 @@ with tab_snap:
 
         rows = []
         for label, col, typ in metrics:
-            if col not in df.columns: 
+            if col not in df.columns:
                 continue
             if typ == "rank":
                 hs, hd = _rank_score(home_row, col); as_, ad = _rank_score(away_row, col)
@@ -1159,4 +1215,3 @@ with tab_guide:
 **Tip:** Use grounding sparingly. The idea is to *temper* ratings (e.g., soft schedules inflate teams), not to rewrite them. Keep σ realistic; overly small σ will overstate edges.
         """
     )
-
