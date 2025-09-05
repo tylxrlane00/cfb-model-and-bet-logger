@@ -5,6 +5,7 @@
 # - Keeps tab position when saving
 # - Uses stored team names on bets (works even without CSV)
 # - Saved projections capture ALL tunings and can be loaded back
+# - Market Lines (home line, total, prices) are saved/loaded & shown on cards
 
 import math
 import os
@@ -258,14 +259,12 @@ def _build_bet_embed(b: dict) -> dict:
     stake = b.get("stake")
     note = (b.get("note") or "").strip()
 
-    # Build the “Spread | … @ price” line
     if typ == "Spread":
         hb = b.get("home_based_line")
         team = H if side == "Home" else A
         if hb is None:
             sel = f"{team}"
         else:
-            # home_based_line is from home’s perspective; flip sign for Away picks
             line_for_pick = float(hb) if side == "Home" else -float(hb)
             sel = f"{team} {line_for_pick:+.1f}"
         mid = f"Spread | {sel} @ {odds_txt}"
@@ -273,7 +272,7 @@ def _build_bet_embed(b: dict) -> dict:
         ttl = b.get("total_line")
         ttl_txt = f"{float(ttl):.1f}" if isinstance(ttl, (int, float)) else "—"
         mid = f"Total | {ou} {ttl_txt} @ {odds_txt}"
-    else:  # Moneyline
+    else:
         team = H if side == "Home" else A
         mid = f"Moneyline | {team} ML @ {odds_txt}"
 
@@ -309,7 +308,6 @@ def send_discord_bet(bet: dict):
     ok, detail = _notify_discord_webhook(embed=embed)
     if ok:
         return
-    # Optional fallback via Edge Function
     sb_url = (os.environ.get("SB_URL") or st.secrets.get("supabase", {}).get("url"))
     srk = (
         os.environ.get("SB_SERVICE_KEY")
@@ -399,14 +397,12 @@ def _apply_pending_controls(teams_list):
     vals = ss.pop("_pending_controls", None)
     if not isinstance(vals, dict):
         return
-    # Team keys first (only if valid for current CSV)
     ht = vals.get("home_team_sel")
     at = vals.get("away_team_sel")
     if ht in teams_list:
         ss["home_team_sel"] = ht
     if at in teams_list:
         ss["away_team_sel"] = at
-    # The rest
     for k, v in vals.items():
         if k in {"home_team_sel", "away_team_sel"}:
             continue
@@ -691,6 +687,7 @@ with tab_adj:
             "resume_cap": float(resume_cap), "resume_sigma_pct": int(resume_sigma_pct),
         }
 
+        # Also save top-level market fields for convenience & easy display
         st.session_state.latest_projection = {
             "home_team": home_team, "away_team": away_team,
             "home_pts": float(home_pts_model), "away_pts": float(away_pts_model),
@@ -702,6 +699,10 @@ with tab_adj:
             "sigma_margin_eff": float(sigma_margin_eff),
             "recommendation": recommendation,
             "controls": controls_snapshot,
+            "market_spread_home": float(market_spread_home),
+            "market_total": float(market_total),
+            "spread_price": float(spread_price),
+            "total_price": float(total_price),
             "saved_at": datetime.utcnow().isoformat() + "Z",
         }
 
@@ -864,7 +865,6 @@ with tab_bets:
     bettor_names = ["Zak", "Tyler", "John"]
     st.markdown("### Log a Bet")
 
-    # Bet type OUTSIDE the form so changing it re-renders dependent fields immediately
     bet_type_choice = st.selectbox("Bet Type", ["Spread", "Total", "Moneyline"], key="bet_type_choice")
 
     with st.form("bet_form_v2", clear_on_submit=True):
@@ -874,7 +874,6 @@ with tab_bets:
             sportsbook = st.text_input("Sportsbook", placeholder="(optional)")
 
         with l2:
-            # Team inputs if no CSV
             if not DATA_READY:
                 home_team_in = st.text_input("Home team", "")
                 away_team_in = st.text_input("Away team", "")
@@ -889,14 +888,12 @@ with tab_bets:
                 )
             side = st.selectbox("Side / O-U", side_opts, key="side_sel")
 
-            # Lines depend on bet type
             home_based_line = None
             total_line = None
             if bet_type_choice == "Spread":
                 is_home_pick = str(side).startswith("Home")
                 lbl = "Line for chosen team (e.g., -3.5 if your pick is -3.5)"
                 chosen_line = st.number_input(lbl, value=-3.5, step=0.5, key="chosen_line")
-                # Convert to *home-based* for storage: home stays same sign; away flips
                 home_based_line = float(chosen_line) if is_home_pick else -float(chosen_line)
             elif bet_type_choice == "Total":
                 total_line = st.number_input("Total (pts)", value=float(54.5), step=0.5)
@@ -904,7 +901,6 @@ with tab_bets:
         with l3:
             price = st.number_input("Price (American, optional)", value=-110, step=5)
             stake = st.number_input("Stake (units or dollars)", value=1.0, min_value=0.0, step=0.5)
-            # Default: notify ON
             notify_discord = st.checkbox("🔔 Notify Discord", value=True)
 
         note = st.text_area("Description / Note (optional)", "")
@@ -936,7 +932,6 @@ with tab_bets:
             st.success("Bet saved.")
             st.rerun()
 
-    # Board columns
     def _pass_filter(b):
         if show_filter == "All":
             return True
@@ -1055,12 +1050,30 @@ with tab_saved:
             model_spread_str = p.get("model_home_spread_str") or _spread_str_from_points(p)
             blended_spread_str = p.get("blended_home_spread_str","N/A")
             hp = _safe_float(p.get("home_pts")); ap = _safe_float(p.get("away_pts"))
+
+            # Pull market values from controls or top-level if present
+            controls = p.get("controls") or {}
+            _m_home = controls.get("market_spread_home", p.get("market_spread_home"))
+            _m_total = controls.get("market_total", p.get("market_total"))
+            _spr_price = controls.get("spread_price", p.get("spread_price"))
+            _tot_price = controls.get("total_price", p.get("total_price"))
+
             with st.container(border=True):
                 st.write(f"**{away_team_p} @ {home_team_p}**")
                 if not np.isnan(hp) and not np.isnan(ap):
                     st.write(f"**Model:** {home_team_p} {hp:.1f} — {away_team_p} {ap:.1f}")
                 st.write(f"Spread: {model_spread_str} | Total: {tm:.1f}" if not np.isnan(tm) else f"Spread: {model_spread_str}")
                 if not np.isnan(tb): st.write(f"**Blended:** Spread {blended_spread_str} | Total {tb:.1f}")
+
+                # Market snapshot at save time (if available)
+                try:
+                    m_home_txt = f"{float(_m_home):+0.1f}" if _m_home is not None else "—"
+                    m_total_txt = f"{float(_m_total):.1f}" if _m_total is not None else "—"
+                    spr_p_txt = f"{int(_spr_price):+d}" if _spr_price is not None else "—"
+                    tot_p_txt = f"{int(_tot_price):+d}" if _tot_price is not None else "—"
+                    st.write(f"Market (saved): home line {m_home_txt} | total {m_total_txt} | prices {spr_p_txt}/{tot_p_txt}")
+                except Exception:
+                    pass
 
                 # Cover % captured at save time vs market home line
                 if p.get("market_home_spread_str") and p.get("p_cover_market_home") is not None:
@@ -1070,12 +1083,9 @@ with tab_saved:
 
                 cA, cB = st.columns([1,1])
                 with cA:
-                    controls = p.get("controls")
-                    if isinstance(controls, dict):
+                    if isinstance(controls, dict) and controls:
                         if st.button("Load", key=f"load_{p.get('id', j)}"):
-                            # Ensure teams present for current CSV; stage, then rerun
                             to_stage = controls.copy()
-                            # (Redundant but explicit) — keep the saved teams on load
                             to_stage["home_team_sel"] = controls.get("home_team_sel", home_team_p)
                             to_stage["away_team_sel"] = controls.get("away_team_sel", away_team_p)
                             st.session_state["_pending_controls"] = to_stage
