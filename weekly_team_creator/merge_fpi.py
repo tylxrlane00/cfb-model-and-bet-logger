@@ -2,12 +2,15 @@
 """
 merge_fpi_csvs.py — Merge three ESPN FPI CSVs by Team, replacing W-L with Wins/Losses
 
-What it does
+What it does (updated)
 - Loads FPI, RESUME, EFFICIENCIES (any row order) and merges on Team.
 - De-duplicates by Team.
 - Keeps a single CONF column (prefers FPI's).
-- **Parses FPI's 'W-L' into numeric 'Wins' and 'Losses'** even if it's been turned into
-  date-like text such as 'Jan-00', '2-Oct', '10/2/2025', '2025-10-02', etc.
+- **Parses FPI's 'W-L' into numeric 'Wins' and 'Losses'** using a *simple* splitter:
+    • "3, 2", "10-2", "7/5", "7 5" → Wins=first, Losses=second
+    • "W" → Wins=1, Losses=0
+    • "L" → Wins=0, Losses=1
+  (All previous date-like parsing logic is removed.)
 - Drops 'W-L' entirely before merging. Leaves other columns (e.g., 'PROJ W-L') untouched.
 - Sorts output alphabetically by Team.
 - Writes a CSV only.
@@ -31,24 +34,6 @@ import pandas as pd
 # ------------------------
 # Helpers
 # ------------------------
-
-MONTHS = {
-    "jan": 1, "january": 1,
-    "feb": 2, "february": 2,
-    "mar": 3, "march": 3,
-    "apr": 4, "april": 4,
-    "may": 5,
-    "jun": 6, "june": 6,
-    "jul": 7, "july": 7,
-    "aug": 8, "august": 8,
-    "sep": 9, "sept": 9, "september": 9,
-    "oct": 10, "october": 10,
-    "nov": 11, "november": 11,
-    "dec": 12, "december": 12,
-}
-
-def month_to_num(tok: str) -> Optional[int]:
-    return MONTHS.get(tok.lower())
 
 def clean_team(s: str) -> str:
     """Normalize team strings (quotes, nbsp, extra whitespace)."""
@@ -92,61 +77,36 @@ def find_wl_column(df: pd.DataFrame) -> Optional[str]:
             return candidates[key]
     return None
 
-def parse_wl(val) -> Tuple[Optional[int], Optional[int]]:
+def parse_wl_simple(val) -> Tuple[Optional[int], Optional[int]]:
     """
-    Bulletproof parser for Wins/Losses from a text cell that may already be
-    mutated by Excel into a 'date-like' string.
-
-    Handles:
-      - "10-2", "10–2" (various dashes)
-      - "10/2" or "10/2/2025"
-      - "Oct-02", "October 2", "2-Oct", "2 October"
-      - "2025-10-02" (returns 10,2)
-      - Extra decorations like parentheses/commas
-      - Day 0 allowed (e.g., "Jan-00" -> 1, 0)
+    Simple splitter for W-L:
+      - Accepts exactly two integers separated by one delimiter (comma, hyphen, slash, or space):
+        "3, 2" / "10-2" / "7/5" / "7 5"
+      - Accepts single letters "W" or "L"
+      - Everything else -> (NA, NA)
     """
     if val is None or (isinstance(val, float) and np.isnan(val)):
-        return (None, None)
+        return (pd.NA, pd.NA)
 
     s = str(val).strip()
     if not s:
-        return (None, None)
+        return (pd.NA, pd.NA)
 
     # Normalize dashes to hyphen
-    s = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2212]", "-", s)
+    s = re.sub(r"[\u2010-\u2015\u2212]", "-", s)
 
-    # Extract all integers once (for several branches)
-    nums = [int(x) for x in re.findall(r"\d+", s)]
+    # Single-letter outcomes
+    if re.fullmatch(r"[Ww]", s):
+        return (1, 0)
+    if re.fullmatch(r"[Ll]", s):
+        return (0, 1)
 
-    # Month name first (e.g., "Oct-02", "October 2")
-    m = re.search(r"\b([A-Za-z]{3,9})\b[\s\-\/,]*([0-3]?\d)", s)
+    # Exactly two integers with a single non-digit separator sequence
+    m = re.fullmatch(r"\s*(\d+)\s*[^0-9]\s*(\d+)\s*", s)
     if m:
-        mm = month_to_num(m.group(1))
-        if mm:
-            day = int(m.group(2))
-            if 0 <= day <= 31:
-                return mm, day
+        return (int(m.group(1)), int(m.group(2)))
 
-    # Day first then month name (e.g., "2-Oct", "2 October")
-    m = re.search(r"\b([0-3]?\d)\b[\s\-\/,]*([A-Za-z]{3,9})", s)
-    if m:
-        day = int(m.group(1))
-        mm = month_to_num(m.group(2))
-        if mm and 0 <= day <= 31:
-            return mm, day
-
-    # If there are 3+ integers, prefer a (month, day) adjacent pair
-    if len(nums) >= 3:
-        for i in range(len(nums) - 1):
-            a, b = nums[i], nums[i + 1]
-            if 1 <= a <= 12 and 0 <= b <= 31:
-                return a, b
-
-    # If there are exactly 2 integers, use them directly
-    if len(nums) == 2:
-        return nums[0], nums[1]
-
-    return (None, None)
+    return (pd.NA, pd.NA)
 
 def safe_rename_resume(df_resume: pd.DataFrame, fpi_cols: set) -> pd.DataFrame:
     """Add '_resume' suffix to any resume columns that also exist in FPI (excluding Team/CONF)."""
@@ -167,27 +127,26 @@ def add_wins_losses_from_wl_and_drop(df_fpi: pd.DataFrame) -> pd.DataFrame:
     """
     On the FPI dataframe:
       - Find W-L,
-      - Create integer Wins/Losses with robust parsing,
+      - Create integer Wins/Losses with the *simple* parser,
       - Drop W-L entirely.
-    If not found, still ensure Wins/Losses exist (empty).
+    If not found, still ensure Wins/Losses exist (nullable Int64).
     """
     wl_col = find_wl_column(df_fpi)
     if wl_col and wl_col in df_fpi.columns:
         wins_list: List[Optional[int]] = []
         losses_list: List[Optional[int]] = []
         for val in df_fpi[wl_col]:
-            w, l = parse_wl(val)
+            w, l = parse_wl_simple(val)
             wins_list.append(w)
             losses_list.append(l)
-        # Use pandas nullable integer dtype to avoid "0.0" formatting
         df_fpi["Wins"] = pd.Series(wins_list, dtype="Int64")
         df_fpi["Losses"] = pd.Series(losses_list, dtype="Int64")
         df_fpi = df_fpi.drop(columns=[wl_col])
     else:
         if "Wins" not in df_fpi.columns:
-            df_fpi["Wins"] = pd.Series([None] * len(df_fpi), dtype="Int64")
+            df_fpi["Wins"] = pd.Series([pd.NA] * len(df_fpi), dtype="Int64")
         if "Losses" not in df_fpi.columns:
-            df_fpi["Losses"] = pd.Series([None] * len(df_fpi), dtype="Int64")
+            df_fpi["Losses"] = pd.Series([pd.NA] * len(df_fpi), dtype="Int64")
     return df_fpi
 
 def merge_frames(fpi_path: str, resume_path: str, eff_path: str) -> pd.DataFrame:
@@ -207,7 +166,7 @@ def merge_frames(fpi_path: str, resume_path: str, eff_path: str) -> pd.DataFrame
         df_res.drop(columns=[c for c in ["CONF"] if c in df_res.columns]),
         on="Team",
         how="outer",
-        # validate="one_to_one",  # comment out to be resilient if ESPN duplicates slip in
+        # validate="one_to_one",
     )
     merged = merged.merge(
         df_eff.drop(columns=[c for c in ["CONF"] if c in df_eff.columns]),
@@ -234,7 +193,7 @@ def merge_frames(fpi_path: str, resume_path: str, eff_path: str) -> pd.DataFrame
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Merge ESPN FPI CSVs by Team (W-L removed; Wins/Losses added, robust parsing)")
+    ap = argparse.ArgumentParser(description="Merge ESPN FPI CSVs by Team (W-L removed; Wins/Losses added via simple split)")
     ap.add_argument("--fpi", required=True, help="Path to FPI CSV")
     ap.add_argument("--resume", required=True, help="Path to RESUME CSV")
     ap.add_argument("--eff", required=True, help="Path to EFFICIENCIES CSV")
@@ -243,7 +202,7 @@ def main():
 
     merged = merge_frames(args.fpi, args.resume, args.eff)
 
-    # Optional: report rows that failed parsing (should be none after this fix)
+    # Optional: report rows that failed parsing (e.g., if any non 'W, L' style strings remain)
     fails = merged[merged["Wins"].isna() | merged["Losses"].isna()]
     if not fails.empty:
         print(f"[info] {len(fails)} row(s) had missing Wins/Losses after parsing. Example teams:",
