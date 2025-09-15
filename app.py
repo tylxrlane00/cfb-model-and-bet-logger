@@ -6,6 +6,7 @@
 # - Uses stored team names on bets (works even without CSV)
 # - Saved projections capture ALL tunings and can be loaded back
 # - Market Lines (home line, total, prices) are saved/loaded & shown on cards
+# - NEW: Saves P(Over) and P(Under) at the (saved) market total
 
 import math
 import os
@@ -252,8 +253,8 @@ def _build_bet_embed(b: dict) -> dict:
     H = b.get("home_team", "Home")
     A = b.get("away_team", "Away")
     typ = (b.get("type") or "").strip()
-    side = (b.get("side") or "").strip()  # "Home" | "Away" | "" (for Total)
-    ou = (b.get("ou") or "").strip()      # "Over" | "Under" (for Total)
+    side = (b.get("side") or "").strip()
+    ou = (b.get("ou") or "").strip()
     price = b.get("price")
     odds_txt = f"{int(price):+d}" if isinstance(price, (int, float)) else "—"
     stake = b.get("stake")
@@ -662,6 +663,7 @@ with tab_adj:
         p_home_win_model   = normal_cdf(spread_model / max(1e-9, sigma_margin_eff))
         p_home_cover_model = home_cover_probability(spread_model, market_spread_home, sigma_margin_eff)
         p_over_model       = 1.0 - normal_cdf((market_total - total_model) / max(1e-9, sigma_total))
+        p_under_model      = 1.0 - p_over_model
         ev_spread_model    = ev_per_unit(p_home_cover_model, float(spread_price))
         ev_total_over      = ev_per_unit(p_over_model, float(total_price))
         ev_total_under     = ev_per_unit(1.0 - p_over_model, float(total_price))
@@ -691,7 +693,7 @@ with tab_adj:
             "resume_cap": float(resume_cap), "resume_sigma_pct": int(resume_sigma_pct),
         }
 
-        # Also save top-level market fields for convenience & easy display
+        # Also save top-level market fields + O/U probabilities for convenience & display
         st.session_state.latest_projection = {
             "home_team": home_team, "away_team": away_team,
             "home_pts": float(home_pts_model), "away_pts": float(away_pts_model),
@@ -707,6 +709,9 @@ with tab_adj:
             "market_total": float(market_total),
             "spread_price": float(spread_price),
             "total_price": float(total_price),
+            # NEW:
+            "p_over_market_total": float(p_over_model),
+            "p_under_market_total": float(p_under_model),
             "saved_at": datetime.utcnow().isoformat() + "Z",
         }
 
@@ -1080,8 +1085,18 @@ with tab_saved:
                     pass
 
                 # Cover % captured at save time vs market home line
-                if p.get("market_home_spread_str") and p.get("p_cover_market_home") is not None:
+                if p.get("market_home_spread_str") is not None and p.get("p_cover_market_home") is not None:
                     st.write(f"Cover: P({p['market_home_spread_str']} covers) {100*float(p['p_cover_market_home']):.1f}%")
+
+                # NEW: Over/Under probabilities at saved market total
+                if p.get("p_over_market_total") is not None and p.get("p_under_market_total") is not None and _m_total is not None:
+                    try:
+                        mt = float(_m_total)
+                        pov = 100.0 * float(p["p_over_market_total"])
+                        pun = 100.0 * float(p["p_under_market_total"])
+                        st.write(f"Totals: P(Over {mt:.1f}) {pov:.1f}% | P(Under {mt:.1f}) {pun:.1f}%")
+                    except Exception:
+                        pass
 
                 st.write(f"**Rec:** {p.get('recommendation','—')}")
 
